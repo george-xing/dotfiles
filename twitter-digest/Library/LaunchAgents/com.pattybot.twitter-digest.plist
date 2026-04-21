@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pattybot.twitter-digest</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/pattybot/bin/twitter-digest-fire.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>8</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>22</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/pattybot/Library/Logs/twitter-digest.launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/pattybot/Library/Logs/twitter-digest.launchd.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/pattybot</string>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

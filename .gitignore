@@ -1,0 +1,12 @@
+# Runtime state — cookies, last-success markers, failures. Never commit.
+**/state/
+
+# macOS
+.DS_Store
+
+# Log files
+*.log
+
+# Editor detritus
+*.swp
+*~
