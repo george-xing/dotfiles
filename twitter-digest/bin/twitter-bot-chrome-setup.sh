@@ -39,13 +39,30 @@ echo "  ✓ port ${DEBUG_PORT} is free"
 mkdir -p "$PERSISTENT_DIR"
 echo "  ✓ persistent dir ready: $PERSISTENT_DIR"
 
-# 3. Verify the plist is in place (will be after stow).
-if [ ! -f "$PLIST" ]; then
-  echo "ERROR: plist not at $PLIST" >&2
+# 3. Verify the plist is a symlink that resolves into the dotfiles repo.
+#    A plain copy at this path (e.g. from a previous manual install) would
+#    still exist but silently drift from the source of truth, so check for
+#    the symlink specifically AND verify it points where we expect.
+if [ ! -L "$PLIST" ]; then
+  echo "ERROR: expected a symlink at $PLIST, found ${PLIST:+something else}" >&2
   echo "Run \`stow -t ~ twitter-digest\` from ~/dotfiles to symlink it." >&2
   exit 1
 fi
-echo "  ✓ LaunchAgent plist present: $PLIST"
+RESOLVED=$(readlink -f "$PLIST" 2>/dev/null || python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$PLIST")
+EXPECTED_PREFIX="$HOME/dotfiles/twitter-digest/"
+if [ ! -f "$RESOLVED" ]; then
+  echo "ERROR: plist symlink is dangling — resolves to $RESOLVED which doesn't exist" >&2
+  exit 1
+fi
+case "$RESOLVED" in
+  "$EXPECTED_PREFIX"*) ;;
+  *)
+    echo "ERROR: plist symlink resolves outside the dotfiles repo: $RESOLVED" >&2
+    echo "Expected it to resolve under $EXPECTED_PREFIX" >&2
+    exit 1
+    ;;
+esac
+echo "  ✓ LaunchAgent plist symlink ok: $PLIST -> $RESOLVED"
 
 cat <<EOF
 

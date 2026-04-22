@@ -41,13 +41,19 @@ export HOME="/Users/pattybot"
 LOG="$HOME/Library/Logs/twitter-digest.log"
 mkdir -p "$(dirname "$LOG")"
 
-# Wait up to 12s for the daemon Chrome to be reachable AND return a valid JSON
-# /json/version response. KeepAlive can momentarily produce ECONNREFUSED during
-# a respawn (e.g. Chrome auto-update); we don't want to fail on that. We also
-# require a parseable {"Browser": "..."} body — a 200 alone isn't enough.
+# Wait up to 12s (wall-clock) for the daemon Chrome to be reachable AND return
+# a valid JSON /json/version response. KeepAlive can momentarily produce
+# ECONNREFUSED during a respawn (e.g. Chrome auto-update); we don't want to
+# fail on that. A parseable {"Browser": "..."} body is required — a 200 alone
+# isn't enough.
+#
+# Deadline-based, not iteration-based: each curl can take up to 2s and we sleep
+# 1s between attempts, so 12 attempts would be up to ~36s. We want a hard 12s
+# ceiling so launchd doesn't see the wrapper hanging past its expected window.
 wait_for_daemon() {
-  local i response
-  for i in $(seq 1 12); do
+  local deadline response
+  deadline=$(( $(date +%s) + 12 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
     response=$(curl -fsS --max-time 2 "$DAEMON_URL" 2>/dev/null) || { sleep 1; continue; }
     if echo "$response" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if "Browser" in d else 1)' 2>/dev/null; then
       return 0
@@ -77,9 +83,13 @@ wait_for_daemon() {
     exit 2
   fi
 
-  PROMPT="run the twitter-digest skill"
+  # Explicit skill path in the prompt — under launchd with no interactive
+  # context, name-based skill resolution is less deterministic than giving
+  # `claude -p` the exact SKILL.md location to work from.
+  SKILL_PATH="$HOME/.claude/skills/twitter-digest/SKILL.md"
+  PROMPT="Run the twitter-digest skill defined in $SKILL_PATH — execute it as described there."
   if [[ "${1:-}" == "--dry-run" ]]; then
-    PROMPT="run the twitter-digest skill in dry-run mode"
+    PROMPT="Run the twitter-digest skill defined in $SKILL_PATH in dry-run mode — execute it as described there but skip the Telegram send and state-file writes."
   fi
 
   cd "$HOME"
