@@ -123,12 +123,19 @@ end try
 OSA
 )
 
-  # Find the bot Chrome MAIN process (not renderer/gpu helpers, which all
-  # inherit --user-data-dir in their argv). The main proc has no --type= arg.
+  # Find the bot Chrome MAIN process. Two filters in series:
+  #   1. argv contains the bot's user-data-dir (excludes user's daily Chrome)
+  #   2. argv lacks --type= (excludes renderer/gpu/utility helpers that
+  #      inherit user-data-dir from the parent)
+  #   3. process actually owns the LISTEN socket on 9222 (defends against
+  #      stale instances or a respawned-but-different PID returned by pgrep
+  #      before lsof's view catches up)
   BOT_CHROME_PID=""
   for pid in $(pgrep -u "$(id -u)" -f 'user-data-dir=.*twitter-bot-chrome' 2>/dev/null); do
     cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
-    if [ -n "$cmd" ] && [[ "$cmd" != *"--type="* ]]; then
+    [ -n "$cmd" ] || continue
+    [[ "$cmd" == *"--type="* ]] && continue
+    if lsof -nP -p "$pid" -iTCP:${DAEMON_PORT} -sTCP:LISTEN 2>/dev/null | grep -q LISTEN; then
       BOT_CHROME_PID="$pid"
       break
     fi
@@ -145,19 +152,28 @@ OSA
     # Un-minimize the bot Chrome window via CDP (no-op if already normal).
     # AppleScript's activate raises hidden apps but does NOT un-minimize
     # individual windows from the dock — CDP Browser.setWindowBounds does.
-    # Skipped silently if websocket-client isn't available.
-    python3 - <<'PY' 2>/dev/null || true
+    #
+    # Pin /usr/bin/python3 explicitly: the wrapper's PATH puts homebrew
+    # first, where `python3` resolves to a different interpreter that
+    # doesn't have websocket-client installed. The system python3 (3.9)
+    # has it via user-site at ~/Library/Python/3.9/site-packages.
+    #
+    # Best-effort: skipped silently if websocket-client missing, the
+    # CDP call errors, or there's no page target. Activation alone (below)
+    # handles the common "behind another window" case; the un-minimize
+    # is only needed for the "minimized to dock" case.
+    UNMINIMIZE_RESULT=$(/usr/bin/python3 - <<'PY' 2>&1
 import json, urllib.request, sys
 try:
     import websocket
 except ImportError:
-    sys.exit(0)
+    print("skip: websocket-client not installed in /usr/bin/python3"); sys.exit(0)
 try:
     v = json.loads(urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=3).read())
     tt = json.loads(urllib.request.urlopen("http://127.0.0.1:9222/json", timeout=3).read())
-    page = next((t for t in tt if t.get("type") == "page"), None)
-    if not page:
-        sys.exit(0)
+    pages = [t for t in tt if t.get("type") == "page"]
+    if not pages:
+        print("skip: no page targets"); sys.exit(0)
     ws = websocket.create_connection(v["webSocketDebuggerUrl"], suppress_origin=True, timeout=3)
     def call(id_, method, params):
         ws.send(json.dumps({"id": id_, "method": method, "params": params}))
@@ -165,14 +181,22 @@ try:
             r = json.loads(ws.recv())
             if r.get("id") == id_:
                 return r
-    r = call(1, "Browser.getWindowForTarget", {"targetId": page["id"]})
-    if "result" in r:
+    # Iterate every page (a single bot Chrome can have multiple windows).
+    seen_windows = set()
+    for page in pages:
+        r = call(len(seen_windows)*2+1, "Browser.getWindowForTarget", {"targetId": page["id"]})
+        if "result" not in r: continue
         wid = r["result"]["windowId"]
-        call(2, "Browser.setWindowBounds", {"windowId": wid, "bounds": {"windowState": "normal"}})
+        if wid in seen_windows: continue
+        seen_windows.add(wid)
+        call(len(seen_windows)*2, "Browser.setWindowBounds", {"windowId": wid, "bounds": {"windowState": "normal"}})
     ws.close()
-except Exception:
-    pass
+    print(f"un-minimized {len(seen_windows)} window(s)")
+except Exception as e:
+    print(f"skip: {e}")
 PY
+)
+    echo "  pre-fire: cdp un-minimize: $UNMINIMIZE_RESULT"
 
     # Activate by PID. `with timeout` caps the AppleEvent dispatch so a
     # hung TCC permission prompt can't block us indefinitely. `try` swallows
@@ -187,7 +211,33 @@ try
   end timeout
 end try
 OSA
-    sleep 1  # let activation propagate before scrape begins
+
+    # Bounded poll: wait up to 5s for the activation to actually settle.
+    # Window activation is async on macOS; a fixed sleep is empirically thin
+    # under load or during a Space-switch animation.
+    ACTIVATION_CONFIRMED=false
+    for _ in 1 2 3 4 5; do
+      CURRENT_FRONTMOST=$(osascript <<OSA 2>/dev/null
+try
+  with timeout of 1 seconds
+    tell application "System Events"
+      return unix id of first application process whose frontmost is true
+    end tell
+  end timeout
+end try
+OSA
+)
+      if [ "$CURRENT_FRONTMOST" = "$BOT_CHROME_PID" ]; then
+        ACTIVATION_CONFIRMED=true
+        break
+      fi
+      sleep 1
+    done
+    if [ "$ACTIVATION_CONFIRMED" = true ]; then
+      echo "  pre-fire: activation confirmed (bot Chrome is frontmost)"
+    else
+      echo "  pre-fire: WARN activation didn't settle within 5s; SKILL.md visibility check may hard-fail"
+    fi
   fi
 
   # Explicit skill path in the prompt — under launchd with no interactive
@@ -204,10 +254,26 @@ OSA
   STATUS=$?
 
   # === Post-fire: restore prior frontmost app ===
-  # Only restore if we have a valid prior PID and it's not the bot Chrome
-  # itself (which would be a no-op).
+  # Only restore if ALL three hold:
+  #   1. We have a valid prior PID
+  #   2. Prior PID isn't the bot Chrome itself (would be no-op)
+  #   3. Bot Chrome is STILL frontmost — i.e. user hasn't manually switched
+  #      to another app during the 5-8 min scrape. If they have, restoring
+  #      would clobber their current focus choice.
   if [ -n "$SAVED_FRONTMOST_PID" ] && [ "$SAVED_FRONTMOST_PID" != "$BOT_CHROME_PID" ]; then
-    osascript <<OSA 2>/dev/null || true
+    POST_FIRE_FRONTMOST=$(osascript <<OSA 2>/dev/null
+try
+  with timeout of 3 seconds
+    tell application "System Events"
+      return unix id of first application process whose frontmost is true
+    end tell
+  end timeout
+end try
+OSA
+)
+    if [ "$POST_FIRE_FRONTMOST" = "$BOT_CHROME_PID" ]; then
+      echo "  post-fire: restoring frontmost to PID=$SAVED_FRONTMOST_PID"
+      osascript <<OSA 2>/dev/null || true
 try
   with timeout of 5 seconds
     tell application "System Events"
@@ -216,6 +282,9 @@ try
   end timeout
 end try
 OSA
+    else
+      echo "  post-fire: user moved to PID=$POST_FIRE_FRONTMOST during scrape; not restoring"
+    fi
   fi
 
   echo "----- exit $STATUS at $(date -Iseconds) -----"

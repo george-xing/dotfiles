@@ -7,9 +7,21 @@ There are TWO launchctl jobs that work together:
 - `com.pattybot.twitter-bot-chrome` — long-running daemon Chrome with persistent profile at `~/Library/Application Support/twitter-bot-chrome/` and CDP debug port 9222. `KeepAlive: true`. **Always running.**
 - `com.pattybot.twitter-digest` — the twice-daily timer (08:00 and 22:00 ET) that fires the wrapper, which attaches to the daemon and runs the skill.
 
-The wrapper auto-foregrounds the bot Chrome window before each fire (PID-disambiguated AppleScript activate via System Events; CDP `Browser.setWindowBounds` un-minimize as belt-and-braces). It also saves the prior frontmost app and restores it after the fire so your work doesn't stay disrupted.
+The wrapper auto-foregrounds the bot Chrome window before each fire:
+- **Activate by PID** via System Events (PID-disambiguated so it can't accidentally target your daily Chrome).
+- **Bounded poll** (up to 5s) confirms the activation actually settled before claude -p starts.
+- **CDP `Browser.setWindowBounds windowState=normal`** as belt-and-braces for the dock-minimized case (best-effort — silently skipped if the system python3's websocket-client isn't installed; activation alone handles the more common "behind another window" case anyway).
+- **Restore prior frontmost after the fire** — but ONLY if bot Chrome is still frontmost at restore time. If you manually switched to another app during the 5-8 min scrape, your choice is preserved (no clobber).
 
-Caveat: foregrounding requires macOS Automation (TCC) permission for the calling shell. The first time the wrapper runs (whether via launchd or a manual fire), macOS will prompt with something like *"bash" wants to control "System Events"* — click **OK**. After that the permission persists and subsequent fires foreground silently. If TCC is denied (or the prompt is missed), the wrapper continues without activation and the SKILL.md visibility check hard-fails cleanly — same outcome as before this feature, no worse.
+**TCC permission setup (one-time).** System Events scripting requires macOS Automation permission for the calling process. The launchd-fired bash invocation may not produce a visible TCC prompt the first time (launchd's security context doesn't always surface prompts in the active GUI session). To avoid silent activation skips on the first scheduled fire, **pre-grant the permission interactively before relying on launchd**:
+
+```bash
+~/bin/twitter-digest-fire.sh --dry-run
+```
+
+Run this from your Terminal (or iTerm, etc.). The first time, macOS prompts with *"<Terminal>" wants to control "System Events"* — click **OK**. The permission persists in System Settings → Privacy & Security → Automation. After that, subsequent fires (manual or launchd-triggered) activate silently.
+
+If TCC is denied (or pre-grant was skipped), the wrapper logs a warning and continues without activation; the SKILL.md visibility check will hard-fail cleanly with `kind: visibility` — same outcome as before this feature, just no recovery.
 
 ## Manual fire (any time)
 
