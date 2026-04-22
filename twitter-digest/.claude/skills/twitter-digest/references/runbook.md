@@ -131,4 +131,3 @@ tail -50 ~/Library/Logs/twitter-digest.log
 - `state/last-success.json` — written after a successful Telegram send. Next run reads its `runAt` as the cutoff.
 - `state/pending.json` — written just before the Telegram send; removed on success. If present at the start of a new run, it means the previous fire crashed after scroll but before Telegram confirmed — forensic crumb, not consumed.
 - `state/last-failure.json` — written when the skill fails unrecoverably. Contains `{kind, at, message}`.
-- `state/x-cookies.json` — **deprecated.** Was used by the old `browser-use cookies import` flow before the persistent-daemon migration. No longer consumed. Safe to delete; gitignored anyway.
