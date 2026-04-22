@@ -7,7 +7,9 @@ There are TWO launchctl jobs that work together:
 - `com.pattybot.twitter-bot-chrome` — long-running daemon Chrome with persistent profile at `~/Library/Application Support/twitter-bot-chrome/` and CDP debug port 9222. `KeepAlive: true`. **Always running.**
 - `com.pattybot.twitter-digest` — the twice-daily timer (08:00 and 22:00 ET) that fires the wrapper, which attaches to the daemon and runs the skill.
 
-The bot Chrome window MUST be foreground in your GUI session at fire time — `document.visibilityState` must be `"visible"`. The skill hard-fails if it isn't (no fake-active state masking). Operator's responsibility to keep the bot Chrome window unobscured around 8am and 10pm.
+The wrapper auto-foregrounds the bot Chrome window before each fire (PID-disambiguated AppleScript activate via System Events; CDP `Browser.setWindowBounds` un-minimize as belt-and-braces). It also saves the prior frontmost app and restores it after the fire so your work doesn't stay disrupted.
+
+Caveat: foregrounding requires macOS Automation (TCC) permission for the calling shell. The first time the wrapper runs (whether via launchd or a manual fire), macOS will prompt with something like *"bash" wants to control "System Events"* — click **OK**. After that the permission persists and subsequent fires foreground silently. If TCC is denied (or the prompt is missed), the wrapper continues without activation and the SKILL.md visibility check hard-fails cleanly — same outcome as before this feature, no worse.
 
 ## Manual fire (any time)
 
@@ -95,7 +97,7 @@ The promoted-posts filter is in SKILL.md (the `isPromoted` check in the extracti
 
 | `kind` in last-failure.json | What happened | Fix |
 |---|---|---|
-| `visibility` | Bot Chrome window not foreground when scrape ran. `vis !== "visible"` after navigation. | Bring bot Chrome window to front (Mission Control → click). Re-fire manually. Long-term: don't put another full-screen app in front of the bot Chrome around 08:00 / 22:00. |
+| `visibility` | Bot Chrome window not foreground when scrape ran. `vis !== "visible"` after navigation. | The wrapper auto-foregrounds before each fire, so this should be rare. If it recurs, the cause is one of: (a) TCC Automation permission for bash was never granted (check System Settings → Privacy & Security → Automation; bash should appear with System Events checked); (b) the bot Chrome window is on a different macOS Space and activation didn't switch you over (rare — System Events activate usually pulls focus across Spaces); (c) launchd's bash invocation lost the TCC grant after a macOS update. Re-grant via interactive `~/bin/twitter-digest-fire.sh --dry-run` and respond to the prompt. |
 | `auth` | Login wall — X invalidated the bot's session. | Sign in again interactively in the bot Chrome window (see "Re-auth" above). |
 | `dom` | Visibility OK, no login wall, but `[data-testid="primaryColumn"]` not found. | X UI changed — update the selectors in SKILL.md step 2/3. |
 | `telegram` | Telegram delivery failed even after the plain-text retry. | Check `state/last-failure.json#message` for Telegram's response. Often "message is too long" or "can't parse entities" — fix the compose step. |
