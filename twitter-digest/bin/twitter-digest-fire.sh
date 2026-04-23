@@ -123,19 +123,25 @@ end try
 OSA
 )
 
-  # Find the bot Chrome MAIN process. Two filters in series:
-  #   1. argv contains the bot's user-data-dir (excludes user's daily Chrome)
-  #   2. argv lacks --type= (excludes renderer/gpu/utility helpers that
-  #      inherit user-data-dir from the parent)
-  #   3. process actually owns the LISTEN socket on 9222 (defends against
-  #      stale instances or a respawned-but-different PID returned by pgrep
-  #      before lsof's view catches up)
+  # Find the bot Chrome MAIN process via lsof on the 9222 LISTEN socket —
+  # this is the single source of truth, since exactly one process actually
+  # owns the listener (helpers inherit the FD but aren't reported by
+  # `lsof -iTCP:9222 -sTCP:LISTEN` unless we explicitly ask via -p).
+  #
+  # We previously tried pgrep-then-cross-check (sequence: find candidates by
+  # argv, then verify each owns the listener). That approach failed at the
+  # 22:00 fire on 2026-04-22 — the WARN message fired even though the
+  # daemon was healthy. Suspected pgrep transient. Starting from lsof
+  # eliminates that fragility entirely.
+  #
+  # Sanity check (paranoid): confirm the picked PID isn't a --type= helper.
+  # The bound listener should always be the main browser, but the check
+  # is cheap insurance against a future Chrome change.
   BOT_CHROME_PID=""
-  for pid in $(pgrep -u "$(id -u)" -f 'user-data-dir=.*twitter-bot-chrome' 2>/dev/null); do
+  for pid in $(lsof -nP -iTCP:${DAEMON_PORT} -sTCP:LISTEN -t 2>/dev/null); do
     cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
     [ -n "$cmd" ] || continue
-    [[ "$cmd" == *"--type="* ]] && continue
-    if lsof -nP -p "$pid" -iTCP:${DAEMON_PORT} -sTCP:LISTEN 2>/dev/null | grep -q LISTEN; then
+    if [[ "$cmd" != *"--type="* ]]; then
       BOT_CHROME_PID="$pid"
       break
     fi
