@@ -84,7 +84,7 @@ sleep 2
 
 Stop conditions, whichever first:
 - **3 minutes wall-clock elapsed** (recall target — empirically yields ~140-160 fresh tweets on For You)
-- **3 consecutive scrolls produce zero new unique tweets** (feed cache exhausted)
+- **3 consecutive scrolls produce zero new unique tweets** (stall — invoke step 3a screenshot-then-judge before treating as exhaustion)
 - 150 scroll iterations (safety net)
 
 **Do NOT use stale-percentage-based early termination.** Empirical per-scroll tracing on For You shows `stale%` oscillates wildly between 30% and 100% even while meaningful fresh content is still being surfaced — the algorithm interleaves pockets of old and new. A "3 consecutive scrolls > N% stale" rule fires on the stale pockets and misses the fresh ones right after.
@@ -108,7 +108,7 @@ browser-use --cdp-url http://127.0.0.1:9222 eval "
 "
 ```
 
-If after 3 scroll attempts no new tweets appear, stop — likely rate-limit. Summarize what you have and ship; don't hammer.
+If after 3 scroll attempts no new tweets appear, **do not immediately ship** — invoke step 3a (screenshot-then-judge). The underlying cause may be a dismissable modal, a transient render issue, an auth-wall flip mid-run, or genuine feed exhaustion / rate limit, and the correct action differs by case.
 
 After each scroll, pause 1-2s for content to load, then grab a batch via `eval`:
 
@@ -144,6 +144,54 @@ Selector notes:
 - `/article/` URL pattern — long-form X Articles (may evolve; adapt if you spot a different pattern)
 
 Accumulate batches; dedupe by `(author, text)` since later scrolls re-emit earlier tweets.
+
+### 3a. Stall recovery (screenshot-then-judge)
+
+When the scroll loop stalls — `window.scrollBy` followed by the `scrollIntoView` fallback both produced 3 consecutive zero-new-tweet iterations — capture a screenshot and inspect it visually before deciding to ship, recover, or hard-fail. Predetermined DOM checks ("is there a `[role=dialog]`?") fail every time X re-skins a modal; visual judgment generalizes.
+
+```bash
+SCREENSHOT="/tmp/twitter-digest-stall-$(date +%Y%m%dT%H%M%S).png"
+browser-use --cdp-url http://127.0.0.1:9222 screenshot "$SCREENSHOT"
+```
+
+Then *read the image yourself* and map what you see to one row in this table:
+
+| What you see | Action |
+|---|---|
+| Empty timeline / repeated tweets / "you're all caught up" / "see new posts" pill / no obvious obstruction | **Ship.** Treat as normal end-of-loop (feed exhaustion or rate-limit). Proceed to step 4 with the tweets accumulated so far. |
+| Modal, dialog, banner, snooze prompt, "verified is here" promo, birthday card, year-in-review, or any other interstitial obstructing the timeline | **Press Escape once**, sleep 1-2s, reset the consecutive-stall counter, retry the scroll loop. If stall recurs after Esc, escalate via this same table on the next stall — but never press Esc twice in a row at one stall event. |
+| Login wall / "Sign up to continue" / OAuth flow / "Log in to X" copy | **Hard-fail `kind: "auth"`** with the screenshot path. Cookies expired mid-run; operator re-signs-in via the bot Chrome window. |
+| Page chrome looks fundamentally different from a normal X home (no `primaryColumn`, completely different layout, error page, "this site can't be reached") | **Hard-fail `kind: "dom"`** with the screenshot path. Operator updates selectors. |
+| Black render, blank page, or screenshot is mostly empty pixels | **Hard-fail `kind: "visibility"`** with the screenshot path. Window dropped foreground or display surface mid-scrape (rare with the dummy plug). |
+| Genuinely uncertain — the screen shows something but you can't classify it confidently | **Hard-fail `kind: "stall"`** with the screenshot path. Operator inspects manually. |
+
+**Bounded action set during stall recovery — only these mutating actions are sanctioned:**
+
+1. `Escape` keystroke (at most once per stall event, only on the modal-class row above).
+2. Continue scrolling via the existing `window.scrollBy` / `scrollIntoView` mechanics.
+3. Hard-fail with a categorized kind (writes `state/last-failure.json` and exits).
+
+**Specifically forbidden:**
+
+- Clicking any button, link, or interactive element by selector — even ones that look obviously dismiss-y like "Got it", "Skip", "Maybe later", "Continue". Deterministic-button-click on every fire is a behavioral signature; auto-clicking "Accept" on a TOS modal commits the operator to terms unread; auto-clicking "Continue" on consent flows may grant data sharing.
+- Typing into any input.
+- Submitting any form.
+- Calling `location.reload()` or otherwise reloading the page.
+- Navigating away from `x.com/home` (article URL navigation in step 4 is the only sanctioned exception).
+
+Esc is the only sanctioned UI mutation because (a) it's the universal human modal-close keystroke that's used by every keyboard-fluent person, (b) it doesn't depend on brittle close-button selectors that drift with each X redesign, (c) it no-ops harmlessly on non-modal pages, and (d) capping at one Esc per stall event prevents any repeated-keystroke pattern.
+
+CDP key dispatch for Escape (use `eval` for consistency with the rest of the skill):
+
+```bash
+browser-use --cdp-url http://127.0.0.1:9222 eval "
+  document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape', code:'Escape', keyCode:27, which:27, bubbles:true, cancelable:true}));
+  document.dispatchEvent(new KeyboardEvent('keyup',   {key:'Escape', code:'Escape', keyCode:27, which:27, bubbles:true, cancelable:true}));
+"
+sleep 2
+```
+
+X's modal close handlers listen for `keydown:Escape` on document or window — synthetic `KeyboardEvent` dispatch satisfies them. After Esc, sleep 1-2s for the modal close animation, then resume the scroll loop with a fresh stall counter.
 
 ### 4. Pull long-form articles (after scroll loop ends)
 
@@ -302,13 +350,16 @@ Do NOT call `browser-use close --all` even in dry-run — the daemon Chrome stay
 
 ## Failure handling
 
-Categorize failures and write `state/last-failure.json` with one of these `kind` values:
+Categorize failures and write `state/last-failure.json` with `{kind, at, message}` plus optional `screenshot` — an absolute path to a CDP-captured PNG of the visible state at failure time. Step 3a always captures screenshots for stall-derived failures; step 4 already does for article-extraction failures; step 2's hard-fails may include them when useful. Operators read the screenshot to disambiguate similar failure modes (e.g. "is this `auth` or `dom`?" — the image makes it obvious).
+
+`kind` values:
 
 - `kind: "visibility"` — bot Chrome window not foreground (`vis !== "visible"` after navigation). Operator brings the window to front and re-fires. Don't fake foreground via CDP.
 - `kind: "auth"` — login wall present in the bot Chrome (cookies expired). Operator opens the bot Chrome window, signs into X manually, no reseed script needed. Don't try to log in programmatically — X flags automated logins.
 - `kind: "dom"` — visibility OK, no login wall, but `primaryColumn` missing. Likely an X UI change. Operator updates the selectors in this skill.
 - `kind: "telegram"` — Telegram delivery failed even after the plain-text retry. Captures the response description.
 - `kind: "empty"` — feed truly returned zero tweets in the cutoff window (rare). Treated as success: write `last-success.json` with `tweetCount: 0` so the cutoff advances; send the `Nothing notable 🥱` message.
+- `kind: "stall"` — scroll loop stalled and the step-3a screenshot didn't match any recoverable or pre-categorized state. Operator inspects the screenshot at `last-failure.json#screenshot`. Common causes: a new modal variant worth a future Esc-class entry, a rate-limit pattern not yet seen, or an X UI variant the classifier in 3a didn't recognize. After diagnosing, operator may update 3a's classification table and re-fire — the failure-kind taxonomy is intentionally evolving rather than fixed.
 
 In all hard-fail cases, do NOT advance `last-success.json` — the next run must see the same cutoff so it doesn't silently skip the window.
 
@@ -320,6 +371,7 @@ In all hard-fail cases, do NOT send a Telegram alert about the failure. Operator
 - **Do not call `browser-use close --all`.** That kills sessions; the daemon Chrome's lifetime is launchd's responsibility, not the skill's.
 - **Do not try to log in programmatically.** X aggressively flags automated logins; operator must sign in manually via the bot Chrome window.
 - **Do not fake the foreground state.** The CDP `Page.setWebLifecycleState("active")` and `Emulation.setVisibleSize` hacks produce a state-mismatch (page lifecycle says active, OS says backgrounded) that's itself detectable. Hard-fail and require operator to actually bring the window foreground.
+- **Stay inside the bounded action set during stall recovery.** Per step 3a, the only sanctioned mutating actions on stall are: a single Esc keystroke per stall event, continue scrolling via `window.scrollBy` / `scrollIntoView`, or hard-fail with a categorized kind. Do NOT click buttons by selector — even ones that look obviously dismiss-y. Deterministic clicks are a behavioral signature, and auto-clicking "Accept" / "Continue" / "I agree" on TOS, consent, or age-verification modals commits the operator to terms they haven't reviewed. Do NOT type into inputs, submit forms, call `location.reload()`, or navigate away from `x.com/home` (article URL navigation in step 4 is the only sanctioned exception).
 - **Do not hammer X.** If you hit a rate-limit indicator, stop scrolling immediately, summarize what you have, deliver, and exit.
 - **Do include tweet URLs in the themed sections, but wrapped in the `@author tweeted/posted` attribution link only.** Don't emit a separate URL line.
 - **Do not advance state on Telegram failure.** A failed send must NOT update `last-success.json`.
