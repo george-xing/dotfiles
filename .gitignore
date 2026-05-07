@@ -10,3 +10,7 @@
 # Editor detritus
 *.swp
 *~
+
+# Claude Code per-machine overrides + remember plugin local state
+.claude/settings.local.json
+.remember/
