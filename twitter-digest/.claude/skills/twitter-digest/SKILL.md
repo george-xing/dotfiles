@@ -62,13 +62,45 @@ Expected: `vis === "visible"`, `iw > 0`, `ih > 0`, `title === "Home / X"`, `hasP
 
 **Failure semantics — hard fail with the matching `kind`, do NOT paper over:**
 
-- `vis !== "visible"` or `iw === 0` → daemon Chrome window is backgrounded behind another app. Write `state/last-failure.json` with `{ "kind": "visibility", "at": "<iso>", "message": "bot Chrome window not foreground; vis=<state>, iw=<n>, ih=<n>" }` and exit non-zero. Do **NOT** apply `Page.setWebLifecycleState("active")` or `Page.bringToFront` to fake foreground — the resulting state-mismatch (page lifecycle says active, OS still says backgrounded) is itself a detection signal we're trying to remove. Operator action: bring the bot Chrome window to the front (Mission Control, click the window, etc.) and re-fire.
+- `vis !== "visible"` or `iw === 0` → daemon Chrome window is backgrounded. **First attempt CDP self-recovery via `Page.bringToFront`, then re-probe.** Unlike page-lifecycle hacks, `Page.bringToFront` is not fakery — Chromium's `PageHandler::BringToFront` calls `WebContentsImpl::Activate()` + `Focus()`, which on macOS dispatches the same `[NSWindow makeKeyAndOrderFront:]` path a real user click triggers (see `content/browser/devtools/protocol/page_handler.cc:1683`). If `vis` flips to `"visible"` after the call, page and OS state genuinely agree — no mismatch to detect, proceed normally. If `vis` is still `"hidden"` (macOS can resist background-process focus-steal under some conditions), hard-fail: write `state/last-failure.json` with `{ "kind": "visibility", "at": "<iso>", "message": "bot Chrome window not foreground; vis=<state> after bringToFront retry" }` and exit non-zero. Do **NOT** fall back to `Page.setWebLifecycleState("active")` — that one *is* fakery (changes only page lifecycle, OS state stays backgrounded → genuine detectable mismatch). Operator action on hard-fail: bring the bot Chrome window front manually (Mission Control, click the window) and re-fire.
+
+  CDP call snippet (python3 + websocket-client, same pattern as the wrapper's un-minimize step):
+  ```bash
+  /usr/bin/python3 - <<'PY'
+  import json, urllib.request, websocket
+  pages = [t for t in json.loads(urllib.request.urlopen("http://127.0.0.1:9222/json").read())
+           if t.get("type") == "page" and "x.com" in t.get("url", "")]
+  ws = websocket.create_connection(pages[0]["webSocketDebuggerUrl"], suppress_origin=True, timeout=3)
+  ws.send(json.dumps({"id": 1, "method": "Page.bringToFront"}))
+  while True:
+      r = json.loads(ws.recv())
+      if r.get("id") == 1: print("bringToFront:", r); break
+  ws.close()
+  PY
+  sleep 1
+  # then re-run the visibility probe from above
+  ```
 - `hasLoginWall === true` or `title` matches the public landing → cookies expired. Write `state/last-failure.json` with `{ "kind": "auth", "at": "<iso>", "message": "bot Chrome session logged out; sign in via the bot window" }` and exit. Do NOT attempt to log in. Operator action: focus the bot Chrome window, navigate to `https://x.com/i/flow/login`, sign in. The cookies persist in the daemon's profile across restarts.
 - `hasPrimaryColumn === false` despite `vis === "visible"` and no login wall → DOM rendered but timeline container missing. Likely an X UI change; write `kind: "dom"` failure and exit. Operator updates selectors in this skill.
 
-### 2b. Ensure For You tab is active
+### 2b. Refresh feed via Home-tab click
 
-x.com/home usually lands on "For You" by default — what this digest consumes (matches what the user reads). Defensive click (no-op if already active):
+Click the left-nav Home tab while already on `/home`. This is the canonical X gesture for "give me a fresh feed" and triggers an SPA same-route handler that scrolls to top, auto-expands any pending "See new posts" pill, and **re-issues a fresh `home_timeline` API request**. Without this, a long-idle daemon Chrome session can drift into algorithmic throttle where scroll/scrollIntoView won't surface more than a tiny initial batch (the May 8 morning run hit this, plateauing at 4-5 tweets even after every other recovery tactic was exhausted).
+
+```bash
+browser-use --cdp-url http://127.0.0.1:9222 eval "
+  const link = document.querySelector('a[data-testid=\\"AppTabBar_Home_Link\\"]');
+  if (link) link.click();
+  ({clicked: !!link})
+"
+sleep 4
+```
+
+This setup-time use is **uncounted** — it does not consume the recovery cap of 2 for mid-run Home-clicks (see step 3 toolkit). Different roles, different cap accounting: setup warms the feed once per run; recovery is for breaking out of a mid-loop plateau.
+
+### 2c. Ensure For You tab is active
+
+x.com/home usually lands on "For You" by default — what this digest consumes (matches what the user reads). The Home-tab click in 2b can occasionally land on a Trends/Following inner-tab state, so this defensive click runs after (no-op if already active):
 
 ```bash
 browser-use --cdp-url http://127.0.0.1:9222 eval "
@@ -80,118 +112,132 @@ browser-use --cdp-url http://127.0.0.1:9222 eval "
 sleep 2
 ```
 
-### 3. Scroll loop
+### 3. Gather feed content
 
-Stop conditions, whichever first:
-- **3 minutes wall-clock elapsed** (recall target — empirically yields ~140-160 fresh tweets on For You)
-- **3 consecutive scrolls produce zero new unique tweets** (stall — invoke step 3a screenshot-then-judge before treating as exhaustion)
-- 150 scroll iterations (safety net)
+**Goal**: accumulate **as many substantive (non-promoted) tweets as the For You feed will yield** within a **3-minute total wall budget**, using whatever sanctioned tactics the observed state demands. **For You is the only source** — the digest is a faithful read of what X's algorithm surfaced for the user, not a synthetic catch-up assembled from chronological backfill. If For You is sparse (cold-start after long idle, modal-interrupted prefetch, transient throttle), ship under-target rather than reaching elsewhere.
 
-**Do NOT use stale-percentage-based early termination.** Empirical per-scroll tracing on For You shows `stale%` oscillates wildly between 30% and 100% even while meaningful fresh content is still being surfaced — the algorithm interleaves pockets of old and new. A "3 consecutive scrolls > N% stale" rule fires on the stale pockets and misses the fresh ones right after.
+This step is intentionally framed as "goal + sanctioned toolkit," not a prescribed loop. The For You feed has many soft-failure modes — algorithmic cold-start, modal interstitials, mid-run prefetch hiccups, virtualization glitches, transient throttles. A rigid "scroll-stall-ship" loop ships thin digests on any of them. The runtime should iterate tactics from the toolkit until the budget is exhausted, the feed plateaus convincingly, or every sanctioned tactic has been tried without yielding new content.
 
-Treat tweets with **no `timeISO`** as promoted/structurally-anomalous and drop them.
+A useful internal target is **~50 substantive tweets** — enough to triage 2-3 substantive bullets per theme. Don't stop early on hitting it; don't fail or escalate on missing it. It's a "is this run going well?" indicator that shapes how aggressively to recover from stalls (well below → keep trying recovery tactics; well above → let plateaus end naturally).
 
-Individual tweets older than the cutoff are still extracted but **filtered at triage time**, not at scroll time.
+#### Sanctioned tactic toolkit
 
-**Scrolling on x.com**: `browser-use scroll` is a no-op (X's virtualized timeline ignores synthetic wheel events). Use `eval` with `window.scrollBy`:
+The only mutating actions allowed in step 3. Apply in whatever order the observed state demands. Per-run caps prevent any tactic from becoming a behavioral signature.
 
-```bash
-browser-use --cdp-url http://127.0.0.1:9222 eval "window.scrollBy(0, 1500)"
-```
+| Tactic | When to use | Per-run cap |
+|---|---|---|
+| `window.scrollBy(0, 1500)` | Default scroll; primary content-pull | unlimited |
+| `tweets[last].scrollIntoView({block:'end'})` | Kick the IntersectionObserver after `scrollBy` plateaus | unlimited |
+| `window.scrollTo(0, 0)` | Re-trigger top-of-feed prefetch (especially after Esc, or when the feed feels frozen) | 3 |
+| `Escape` keystroke (native CDP `Input.dispatchKeyEvent` via `browser-use keys "Escape"`) | Clear interstitials — snooze prompts, year-in-review cards, "verified is here" promos, birthday confetti, any `[role=dialog]`-class overlay | 3 |
+| Click `a[data-testid="AppTabBar_Home_Link"]` (the left-nav Home tab) while already on `/home` | Soft-refresh the For You algorithm — scrolls to top, auto-expands any pending "See new posts" pill, and re-issues a fresh `home_timeline` API request. **Always run once at setup time (step 2b)**, uncounted. May also be used mid-run if the feed plateaus despite scroll/scrollIntoView, capped at the count below | 2 (mid-run only; setup use uncounted) |
+| Hard-fail with categorized `kind` | When `auth` / `dom` / `visibility` failure detected — see step 3a's screenshot table | 1 (run terminates) |
 
-If `window.scrollBy` stops yielding new tweets after several attempts, kick the observer with `scrollIntoView` on the last visible tweet:
+**Nothing else is sanctioned.** No tab-switching to Following or Lists (we want the algorithmic read, not chronological backfill). No clicking buttons by selector beyond the two narrowly-whitelisted clicks above (Home-tab `a[data-testid="AppTabBar_Home_Link"]` and the For-You inner tab) — even dismiss-y ones like "Got it" / "Skip" / "Continue" remain forbidden, those are behavioral signatures *and* may commit the operator to TOS/consent terms. No typing. No form submissions. No `location.reload()`. No navigation away from `x.com/home` (article URL navigation in step 4 is the only sanctioned exception).
 
-```bash
-browser-use --cdp-url http://127.0.0.1:9222 eval "
-  const tweets=document.querySelectorAll('article[data-testid=\\"tweet\\"]');
-  tweets[tweets.length-1]?.scrollIntoView({block:'end'});
-"
-```
+#### How to drive the loop
 
-If after 3 scroll attempts no new tweets appear, **do not immediately ship** — invoke step 3a (screenshot-then-judge). The underlying cause may be a dismissable modal, a transient render issue, an auth-wall flip mid-run, or genuine feed exhaustion / rate limit, and the correct action differs by case.
+1. **Scroll-extract loop**: alternate `window.scrollBy(0, 1500)` and `eval` extraction. Pause 1-2s after each scroll for hydration, then extract:
 
-After each scroll, pause 1-2s for content to load, then grab a batch via `eval`:
+   ```bash
+   browser-use --cdp-url http://127.0.0.1:9222 eval "
+     Array.from(document.querySelectorAll('article[data-testid=\\"tweet\\"]')).slice(0, 80).map(a => {
+       const author = a.querySelector('[data-testid=\\"User-Name\\"]')?.innerText || '';
+       const text = a.querySelector('[data-testid=\\"tweetText\\"]')?.innerText || '';
+       const timeEl = a.querySelector('time');
+       const timeISO = timeEl?.getAttribute('datetime') || null;
+       const statusHref = timeEl?.closest('a')?.getAttribute('href')
+         || a.querySelector('a[href*=\\"/status/\\"]')?.getAttribute('href')
+         || null;
+       const statusUrl = statusHref ? ('https://x.com' + statusHref) : null;
+       const articleAnchor = a.querySelector('a[href*=\\"/article/\\"], a[href*=\\"/i/article/\\"]');
+       const articleLink = articleAnchor ? ('https://x.com' + articleAnchor.getAttribute('href')) : null;
+       const containerText = a.innerText || '';
+       const isPromoted = /\\bPromoted\\b|\\bAd\\b(?=$|\\n)/.test(containerText) || !!a.querySelector('[data-testid=\\"placementTracking\\"]');
+       return {author, text: text.slice(0, 800), timeISO, statusUrl, articleLink, isPromoted};
+     })
+   "
+   ```
 
-```bash
-browser-use --cdp-url http://127.0.0.1:9222 eval "
-  Array.from(document.querySelectorAll('article[data-testid=\\"tweet\\"]')).slice(0, 60).map(a => {
-    const author = a.querySelector('[data-testid=\\"User-Name\\"]')?.innerText || '';
-    const text = a.querySelector('[data-testid=\\"tweetText\\"]')?.innerText || '';
-    const timeEl = a.querySelector('time');
-    const timeISO = timeEl?.getAttribute('datetime') || null;
-    const statusHref = timeEl?.closest('a')?.getAttribute('href')
-      || a.querySelector('a[href*=\\"/status/\\"]')?.getAttribute('href')
-      || null;
-    const statusUrl = statusHref ? ('https://x.com' + statusHref) : null;
-    const articleAnchor = a.querySelector('a[href*=\\"/article/\\"], a[href*=\\"/i/article/\\"]');
-    const articleLink = articleAnchor ? ('https://x.com' + articleAnchor.getAttribute('href')) : null;
-    const containerText = a.innerText || '';
-    const isPromoted = /\\bPromoted\\b|\\bAd\\b(?=$|\\n)/.test(containerText) || !!a.querySelector('[data-testid=\\"placementTracking\\"]');
-    return {author, text: text.slice(0, 800), timeISO, statusUrl, articleLink, isPromoted};
-  })
-"
-```
+   Dedupe by `(author, text)` — later scrolls re-emit earlier tweets, and the dedupe key has to be content-based since X's `data-testid` IDs aren't stable across virtualization recycles.
 
-**Hard filter: drop every tweet where `isPromoted === true` before triage.** Promoted posts are ads.
+2. **When `scrollBy` plateaus** (no new uniques after ~2 scrolls): try `scrollIntoView` on the last article. If that also plateaus (3 consecutive zero-new across both), invoke step 3a (screenshot-then-judge) to pick the next move from the toolkit.
 
-**Soft filter (during theming): drop marketing / influencer-shill content** even when not formally promoted. See `references/themes.md` → "Triage rules".
+3. **Stop the entire run when**:
+   - Wall budget elapsed (3 min total), OR
+   - The For You feed is convincingly exhausted (3a screenshot shows "you're all caught up" / repeated tweets / no obstruction, AND no recovery tactic has any caps remaining), OR
+   - A hard-fail `kind` is set.
 
-Selector notes:
+   Don't stop early on hitting 50 — content quality scales with volume (more raw → better triage → more substantive bullets per theme), so always burn the full wall budget when content's flowing. Use `len(seen)` against 50 to decide how patient to be at stalls: well under → spend a recovery cap to push through; well over → let the plateau end naturally.
+
+4. **Anti-pattern to avoid: stale-percentage-based early termination.** Per-scroll tracing on For You shows `stale%` oscillates wildly between 30% and 100% even while fresh content is still being surfaced — the algorithm interleaves pockets of old and new. A "3 consecutive scrolls > N% stale" rule fires on the stale pockets and misses the fresh ones right after.
+
+#### Filters
+
+- **Hard filter at extract time**: drop every tweet where `isPromoted === true`. Also drop entries with no `timeISO` — they're typically promoted/structurally-anomalous.
+- **Soft filter at triage time**: marketing / influencer-shill content (see `references/themes.md` → "Triage rules"). The cutoff filter is also a triage-time concern; don't filter at scroll time, since age-derived bullets sometimes still warrant inclusion.
+
+#### Selector reference
+
 - `article[data-testid="tweet"]` — canonical tweet container
 - `[data-testid="tweetText"]` — body text
 - `[data-testid="User-Name"]` — author block
 - `time[datetime]` — exact ISO timestamp
+- `[role="tablist"] [role="tab"]` — tablist tabs (For You / Following)
 - `/article/` URL pattern — long-form X Articles (may evolve; adapt if you spot a different pattern)
 
-Accumulate batches; dedupe by `(author, text)` since later scrolls re-emit earlier tweets.
+### 3a. Stall handling (screenshot-then-judge)
 
-### 3a. Stall recovery (screenshot-then-judge)
+When the current source has stalled — `window.scrollBy` followed by the `scrollIntoView` kick both produced 3 consecutive zero-new-tweet iterations — capture a screenshot and inspect it visually to choose the next move from the toolkit. Predetermined DOM checks ("is there a `[role=dialog]`?") fail every time X re-skins a modal; visual judgment generalizes.
 
-When the scroll loop stalls — `window.scrollBy` followed by the `scrollIntoView` fallback both produced 3 consecutive zero-new-tweet iterations — capture a screenshot and inspect it visually before deciding to ship, recover, or hard-fail. Predetermined DOM checks ("is there a `[role=dialog]`?") fail every time X re-skins a modal; visual judgment generalizes.
+Screenshots persist into the skill's state dir (`state/stalls/`) **regardless of whether the run ultimately succeeds, ships under-target, or hard-fails** — they are the only forensic artifact a human can inspect post-hoc to disambiguate the stall's cause (subtle modal vs. scroll-container regression vs. algorithmic plateau). `/tmp` reaping otherwise destroys them between fire and inspection. Keep the last 10 screenshots across all runs:
 
 ```bash
-SCREENSHOT="/tmp/twitter-digest-stall-$(date +%Y%m%dT%H%M%S).png"
+STALLS_DIR=~/.claude/skills/twitter-digest/state/stalls
+mkdir -p "$STALLS_DIR"
+SCREENSHOT="$STALLS_DIR/$(date -u +%Y%m%dT%H%M%SZ).png"
 browser-use --cdp-url http://127.0.0.1:9222 screenshot "$SCREENSHOT"
+
+# Prune to last 10 by mtime
+ls -t "$STALLS_DIR"/*.png 2>/dev/null | tail -n +11 | xargs -I {} rm -f {}
 ```
 
-Then *read the image yourself* and map what you see to one row in this table:
+If the screenshot tool times out repeatedly (a known transient issue with the daemon Chrome under load), fall back to a DOM-text snapshot — `eval "document.body.innerText.slice(0, 4000)"` — and judge from text. Less reliable for visual-only states (e.g., a black-render visibility failure) but unblocks the run. Note the degraded-classification source in the run log so the operator knows.
+
+Then *read the image (or text) yourself* and pick the next tactic:
 
 | What you see | Action |
 |---|---|
-| Empty timeline / repeated tweets / "you're all caught up" / "see new posts" pill / no obvious obstruction | **Ship.** Treat as normal end-of-loop (feed exhaustion or rate-limit). Proceed to step 4 with the tweets accumulated so far. |
-| Modal, dialog, banner, snooze prompt, "verified is here" promo, birthday card, year-in-review, or any other interstitial obstructing the timeline | **Press Escape once**, sleep 1-2s, reset the consecutive-stall counter, retry the scroll loop. If stall recurs after Esc, escalate via this same table on the next stall — but never press Esc twice in a row at one stall event. |
+| Empty timeline / repeated tweets / "you're all caught up" / "see new posts" pill / no obvious obstruction | Feed is genuinely exhausted. **Ship** with what's accumulated. |
+| Modal / dialog / banner / snooze prompt / "verified is here" / birthday card / year-in-review / any interstitial obstructing the timeline | **Press Escape** (if Esc cap remaining), wait 3s, `scrollTo(0, 0)`, wait 1s, resume scroll loop with fresh stall counter. If Esc cap exhausted and the same modal-class state recurs, ship — don't escalate to clicks. |
+| Frozen-but-clean timeline (no obstruction, but `scrollBy` produces no movement and no new tweets after multiple attempts) | `scrollTo(0, 0)` (if cap remaining), wait 5s for prefetch, retry. If still frozen after exhausting `scrollTo` cap, ship. |
 | Login wall / "Sign up to continue" / OAuth flow / "Log in to X" copy | **Hard-fail `kind: "auth"`** with the screenshot path. Cookies expired mid-run; operator re-signs-in via the bot Chrome window. |
 | Page chrome looks fundamentally different from a normal X home (no `primaryColumn`, completely different layout, error page, "this site can't be reached") | **Hard-fail `kind: "dom"`** with the screenshot path. Operator updates selectors. |
 | Black render, blank page, or screenshot is mostly empty pixels | **Hard-fail `kind: "visibility"`** with the screenshot path. Window dropped foreground or display surface mid-scrape (rare with the dummy plug). |
-| Genuinely uncertain — the screen shows something but you can't classify it confidently | **Hard-fail `kind: "stall"`** with the screenshot path. Operator inspects manually. |
+| Genuinely uncertain — the screen shows something but you can't classify it confidently | Try one cheap recovery (Esc if cap remaining; else `scrollTo(0, 0)` if cap remaining). If still unclassified after that, **hard-fail `kind: "stall"`** with the screenshot path. |
 
-**Bounded action set during stall recovery — only these mutating actions are sanctioned:**
+#### Tactic dispatch details
 
-1. `Escape` keystroke (at most once per stall event, only on the modal-class row above).
-2. Continue scrolling via the existing `window.scrollBy` / `scrollIntoView` mechanics.
-3. Hard-fail with a categorized kind (writes `state/last-failure.json` and exits).
-
-**Specifically forbidden:**
-
-- Clicking any button, link, or interactive element by selector — even ones that look obviously dismiss-y like "Got it", "Skip", "Maybe later", "Continue". Deterministic-button-click on every fire is a behavioral signature; auto-clicking "Accept" on a TOS modal commits the operator to terms unread; auto-clicking "Continue" on consent flows may grant data sharing.
-- Typing into any input.
-- Submitting any form.
-- Calling `location.reload()` or otherwise reloading the page.
-- Navigating away from `x.com/home` (article URL navigation in step 4 is the only sanctioned exception).
-
-Esc is the only sanctioned UI mutation because (a) it's the universal human modal-close keystroke that's used by every keyboard-fluent person, (b) it doesn't depend on brittle close-button selectors that drift with each X redesign, (c) it no-ops harmlessly on non-modal pages, and (d) capping at one Esc per stall event prevents any repeated-keystroke pattern.
-
-CDP key dispatch for Escape (use `eval` for consistency with the rest of the skill):
+**Escape keystroke** — must be a **native** key event via CDP `Input.dispatchKeyEvent`, not a synthetic `document.dispatchEvent(new KeyboardEvent(...))`. Use `browser-use keys`, which routes through Playwright's input pipeline and produces `event.isTrusted === true`:
 
 ```bash
-browser-use --cdp-url http://127.0.0.1:9222 eval "
-  document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape', code:'Escape', keyCode:27, which:27, bubbles:true, cancelable:true}));
-  document.dispatchEvent(new KeyboardEvent('keyup',   {key:'Escape', code:'Escape', keyCode:27, which:27, bubbles:true, cancelable:true}));
-"
-sleep 2
+browser-use --cdp-url http://127.0.0.1:9222 keys "Escape"
+sleep 3
+browser-use --cdp-url http://127.0.0.1:9222 eval "window.scrollTo(0, 0); 'ok'"
+sleep 1
 ```
 
-X's modal close handlers listen for `keydown:Escape` on document or window — synthetic `KeyboardEvent` dispatch satisfies them. After Esc, sleep 1-2s for the modal close animation, then resume the scroll loop with a fresh stall counter.
+**Why native, not synthetic** — modern X dialogs (Radix/Headless-class components, including the snooze-topics modal) bind `keydown:Escape` on the focused dialog container, not on `document` or `window`. A synthetic `dispatchEvent` on `document` flips `event.isTrusted = false` AND never reaches the dialog's listener path. The May 8 morning run failed exactly this way: synthetic Esc fired twice, the snooze-topics modal stayed up, the feed plateaued at 4 articles. Confirmed by live test that `browser-use keys "Escape"` does dismiss the same modal.
+
+The 3s post-Esc settle is longer than the close animation alone — modals frequently interrupt X's timeline prefetch query, and the feed needs time to re-issue it. The follow-up `scrollTo(0,0)` puts top-of-feed back in viewport, since X's prefetch is gated on top-of-feed visibility. Without these two extra steps, post-Esc runs commonly observe a sparse 5-cell timeline that never rehydrates within the wall budget.
+
+#### Why this toolkit, and only this
+
+- **Esc** — universal human modal-close keystroke; doesn't depend on brittle close-button selectors that drift with each X redesign; no-ops harmlessly on non-modal pages. Capped at 3 per run because deterministic repeated Esc-ing IS a signature.
+- **`scrollTo(0,0)`** — what a human does when a feed feels frozen ("scroll back to top to refresh"). Capped at 3 because a deterministic top-of-feed reset every fire is also a signature.
+- **`scrollBy` / `scrollIntoView`** — uncapped; the digest's primary content-pull mechanism, and any human spends most of their session scrolling.
+
+Stepping outside these — clicking arbitrary buttons (other than the sanctioned setup-time Home-tab click in step 2b and the For-You ensure-active in step 2c), typing, submitting, reloading, navigating away — re-engages the bot-detection risks the skill is engineered to avoid AND would change the digest's source from "what the algorithm surfaced" to "whatever could be backfilled," which defeats the digest's purpose.
 
 ### 4. Pull long-form articles (after scroll loop ends)
 
@@ -354,11 +400,12 @@ Categorize failures and write `state/last-failure.json` with `{kind, at, message
 
 `kind` values:
 
-- `kind: "visibility"` — bot Chrome window not foreground (`vis !== "visible"` after navigation). Operator brings the window to front and re-fires. Don't fake foreground via CDP.
+- `kind: "visibility"` — bot Chrome window not foreground (`vis !== "visible"` after the CDP `Page.bringToFront` self-recovery attempt also failed). Operator brings the window to front manually and re-fires. Note: `Page.setWebLifecycleState("active")` is still off-limits — that one is real fakery; `Page.bringToFront` is a legitimate OS activation call (page and OS state stay in sync) and is the first thing the skill tries.
 - `kind: "auth"` — login wall present in the bot Chrome (cookies expired). Operator opens the bot Chrome window, signs into X manually, no reseed script needed. Don't try to log in programmatically — X flags automated logins.
 - `kind: "dom"` — visibility OK, no login wall, but `primaryColumn` missing. Likely an X UI change. Operator updates the selectors in this skill.
 - `kind: "telegram"` — Telegram delivery failed even after the plain-text retry. Captures the response description.
 - `kind: "empty"` — feed truly returned zero tweets in the cutoff window (rare). Treated as success: write `last-success.json` with `tweetCount: 0` so the cutoff advances; send the `Nothing notable 🥱` message.
+- **Under-target shipping is NOT a failure.** A run that produces 1-49 tweets is still a successful run — it ships the digest, advances `last-success.json`, and writes nothing to `last-failure.json`. The 50-tweet target in step 3 just shapes how patiently to recover from stalls (well below → spend a recovery cap; well above → let plateaus end naturally); it does NOT gate success. Only zero-tweet runs (with all sanctioned tactics tried) advance into the `kind: "empty"` path.
 - `kind: "stall"` — scroll loop stalled and the step-3a screenshot didn't match any recoverable or pre-categorized state. Operator inspects the screenshot at `last-failure.json#screenshot`. Common causes: a new modal variant worth a future Esc-class entry, a rate-limit pattern not yet seen, or an X UI variant the classifier in 3a didn't recognize. After diagnosing, operator may update 3a's classification table and re-fire — the failure-kind taxonomy is intentionally evolving rather than fixed.
 
 In all hard-fail cases, do NOT advance `last-success.json` — the next run must see the same cutoff so it doesn't silently skip the window.
@@ -371,8 +418,9 @@ In all hard-fail cases, do NOT send a Telegram alert about the failure. Operator
 - **Do not call `browser-use close --all`.** That kills sessions; the daemon Chrome's lifetime is launchd's responsibility, not the skill's.
 - **Do not try to log in programmatically.** X aggressively flags automated logins; operator must sign in manually via the bot Chrome window.
 - **Do not fake the foreground state.** The CDP `Page.setWebLifecycleState("active")` and `Emulation.setVisibleSize` hacks produce a state-mismatch (page lifecycle says active, OS says backgrounded) that's itself detectable. Hard-fail and require operator to actually bring the window foreground.
-- **Stay inside the bounded action set during stall recovery.** Per step 3a, the only sanctioned mutating actions on stall are: a single Esc keystroke per stall event, continue scrolling via `window.scrollBy` / `scrollIntoView`, or hard-fail with a categorized kind. Do NOT click buttons by selector — even ones that look obviously dismiss-y. Deterministic clicks are a behavioral signature, and auto-clicking "Accept" / "Continue" / "I agree" on TOS, consent, or age-verification modals commits the operator to terms they haven't reviewed. Do NOT type into inputs, submit forms, call `location.reload()`, or navigate away from `x.com/home` (article URL navigation in step 4 is the only sanctioned exception).
-- **Do not hammer X.** If you hit a rate-limit indicator, stop scrolling immediately, summarize what you have, deliver, and exit.
+- **Stay inside the step-3 sanctioned tactic toolkit.** Only the moves listed in step 3's toolkit are allowed during content-gathering: scroll variants (`scrollBy`, `scrollIntoView`, `scrollTo(0,0)`), `Escape` keystroke, the whitelisted Home-tab click `a[data-testid="AppTabBar_Home_Link"]`, and hard-fail with a categorized kind. Esc and `scrollTo(0,0)` each capped at 3 per run; mid-run Home-tab clicks capped at 2 (the setup-time Home click in step 2b is uncounted). Do NOT switch to inner tabs other than For You (For You is the digest's only source by design). Do NOT click any other buttons by selector — even ones that look obviously dismiss-y like "Got it" / "Skip" / "Continue". Deterministic clicks are a behavioral signature, and auto-clicking "Accept" / "Continue" / "I agree" on TOS, consent, or age-verification modals commits the operator to terms they haven't reviewed. Do NOT type into inputs, submit forms, call `location.reload()`, or navigate away from `x.com/home` (article URL navigation in step 4 is the only sanctioned exception). Stepping outside the toolkit re-engages the bot-detection-and-consent risks the skill is engineered to avoid.
+- **Don't backfill from outside For You.** If the For You feed is sparse, ship what's there — the digest is meant to reflect what X's algorithm surfaced for the user, not a synthetic catch-up assembled from chronological Following or Lists scraping. A thin digest from a real cold-feed day is more honest than a padded one.
+- **Do not hammer X.** If you hit a rate-limit indicator (anywhere — extract response, screenshot, page title), stop scrolling immediately, summarize what you have, deliver, and exit. Don't try to push through with extra Esc/scrollTo/tab-switch; those will only confirm the rate-limit signal.
 - **Do include tweet URLs in the themed sections, but wrapped in the `@author tweeted/posted` attribution link only.** Don't emit a separate URL line.
 - **Do not advance state on Telegram failure.** A failed send must NOT update `last-success.json`.
 - **Do not send a Telegram error message when Telegram itself is the failure.** Log locally and exit.
