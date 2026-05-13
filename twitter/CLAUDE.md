@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-A single GNU Stow package (`twitter-digest/`) inside `~/dotfiles`. Running `stow -t ~ -R twitter-digest` symlinks every file back to its mirrored path under `$HOME`:
+A single GNU Stow package (`twitter/`) inside `~/dotfiles`. Running `stow -t ~ -R twitter` symlinks every file back to its mirrored path under `$HOME`:
 
 | In repo | Symlinked to |
 |---|---|
@@ -12,9 +12,9 @@ A single GNU Stow package (`twitter-digest/`) inside `~/dotfiles`. Running `stow
 | `bin/twitter-bot-chrome-setup.sh` | `~/bin/twitter-bot-chrome-setup.sh` |
 | `Library/LaunchAgents/com.pattybot.twitter-bot-chrome.plist` | `~/Library/LaunchAgents/com.pattybot.twitter-bot-chrome.plist` |
 | `Library/LaunchAgents/com.pattybot.twitter-digest.plist` | `~/Library/LaunchAgents/com.pattybot.twitter-digest.plist` |
-| `.claude/skills/twitter-digest/{SKILL,references/*}.md` | `~/.claude/skills/twitter-digest/...` |
+| `.claude/skills/twitter/{SKILL,references/*}.md` | `~/.claude/skills/twitter/...` |
 
-Editing the symlinked path and editing the file inside this repo are the same operation — both write through to the repo. After altering the directory layout (adding/moving files), rerun `stow -t ~ -R twitter-digest` to refresh links.
+Editing the symlinked path and editing the file inside this repo are the same operation — both write through to the repo. After altering the directory layout (adding/moving files), rerun `stow -t ~ -R twitter` to refresh links.
 
 There is no build, lint, or test step. The codebase is bash + macOS launchd plists + Markdown skill files.
 
@@ -30,14 +30,14 @@ The fire wrapper:
 - Disambiguates the bot Chrome from the user's daily Chrome via `lsof -iTCP:9222 -sTCP:LISTEN -t`, then activates that PID through System Events (PID-targeted, not bundle-name-targeted — bundle-name would be ambiguous).
 - Invokes `claude -p` with the skill prompt, then restores prior frontmost — but only if bot Chrome is still frontmost at restore time, so that a manual app switch during the 5–8 minute scrape isn't clobbered.
 
-The skill (`.claude/skills/twitter-digest/SKILL.md`) is the actual work: CDP-attach, scroll `x.com/home` ~3 minutes, theme tweets, summarize any X Articles, send to Telegram. The lookback cutoff is read from `state/last-success.json#runAt` (under `~/.claude/skills/twitter-digest/`, gitignored), capped at 24h, so the morning and evening windows hand off without overlap.
+The skill (`.claude/skills/twitter/SKILL.md`) is the actual work: CDP-attach, scroll `x.com/home` ~3 minutes, theme tweets, summarize any X Articles, send to Telegram. The lookback cutoff is read from `state/last-success.json#runAt` (under `~/.claude/skills/twitter/`, gitignored), capped at 24h, so the morning and evening windows hand off without overlap.
 
 ## Operational source of truth
 
 Two reference files document operational behavior — read them before changing operational behavior:
 
-- `.claude/skills/twitter-digest/SKILL.md` — full step-by-step skill workflow, failure-kind taxonomy, "what NOT to do" list. The operative invariants (no spawned browsers, no `close --all`, no fake foreground state, bounded action set during stall recovery) are spelled out here with their reasoning. **Don't re-decide them.**
-- `.claude/skills/twitter-digest/references/runbook.md` — manual-fire commands, daemon control (`launchctl bootout|bootstrap`), TCC permission setup, log paths, re-auth procedure, failure-kind table.
+- `.claude/skills/twitter/SKILL.md` — full step-by-step skill workflow, failure-kind taxonomy, "what NOT to do" list. The operative invariants (no spawned browsers, no `close --all`, no fake foreground state, bounded action set during stall recovery) are spelled out here with their reasoning. **Don't re-decide them.**
+- `.claude/skills/twitter/references/runbook.md` — manual-fire commands, daemon control (`launchctl bootout|bootstrap`), TCC permission setup, log paths, re-auth procedure, failure-kind table.
 
 If you find yourself debating an operational decision (clicking a stall modal, retrying on a curl error, calling `browser-use close`), check those files first — odds are the answer is already there with reasoning.
 
@@ -45,7 +45,7 @@ If you find yourself debating an operational decision (clicking a stall modal, r
 
 ```bash
 # Refresh stow symlinks (after adding/moving/renaming files in the repo)
-cd ~/dotfiles && stow -t ~ -R twitter-digest
+cd ~/dotfiles && stow -t ~ -R twitter
 
 # Smoke-test end-to-end without sending to Telegram (also: triggers the
 # first-run TCC Automation prompt for System Events when run from Terminal)
@@ -64,7 +64,7 @@ launchctl bootout   gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.twitter-bot
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.twitter-bot-chrome.plist
 
 # Edit themes / triage rules — applies to next fire, no reload
-$EDITOR .claude/skills/twitter-digest/references/themes.md
+$EDITOR .claude/skills/twitter/references/themes.md
 
 # Edit fire schedule (StartCalendarInterval array of {Hour, Minute} dicts),
 # then reload the digest job:
@@ -80,7 +80,7 @@ Logs:
 
 ## Editing rules specific to this package
 
-- **State directory is gitignored.** `**/state/` (matches `~/.claude/skills/twitter-digest/state/`) holds `last-success.json`, `last-failure.json`, `pending.json`, and historically cookies. Don't move it inside a tracked path — committing X cookies leaks an authenticated session.
+- **State directory is gitignored.** `**/state/` (matches `~/.claude/skills/twitter/state/`) holds `last-success.json`, `last-failure.json`, `pending.json`, and historically cookies. Don't move it inside a tracked path — committing X cookies leaks an authenticated session.
 - **Wrapper paths are absolute on purpose.** `bin/twitter-digest-fire.sh` hardcodes `/Users/pattybot/.local/bin/claude`, `/Users/pattybot/.local/bin/browser-use`, `/opt/homebrew/bin/node`. launchd's PATH is minimal; relying on `PATH` lookup will silently break under launchd. If you change a binary location, update the variables at the top of the wrapper.
 - **macOS python3 vs Homebrew python3.** The pre-fire CDP un-minimize block in the wrapper pins `/usr/bin/python3` explicitly because it has `websocket-client` available via the system user-site (`~/Library/Python/3.9/site-packages`) while `/opt/homebrew/bin/python3` does not. Don't "simplify" that to bare `python3`.
 - **Plist `ProcessType: Interactive`** on both jobs is required so the daemon Chrome is allowed to render and the wrapper is allowed to script System Events. Don't downgrade it to `Background`.
@@ -92,7 +92,7 @@ Logs:
 
 Operational failures here have a small, well-categorized set of root causes (`visibility`, `auth`, `dom`, `telegram`, `empty`, `stall` — see SKILL.md and runbook.md). Before writing code in response to a failure:
 
-1. Read `~/.claude/skills/twitter-digest/state/last-failure.json` and the screenshot it points at.
+1. Read `~/.claude/skills/twitter/state/last-failure.json` and the screenshot it points at.
 2. Match `kind` against the runbook table — most cases need an operator action (re-foreground the window, re-sign-in, update a selector), not a code change.
 3. **Avoid these "fixes" — they were considered and rejected, with reasoning in SKILL.md:**
    - Faking foreground via CDP `Page.setWebLifecycleState("active")` or `Page.bringToFront`.
