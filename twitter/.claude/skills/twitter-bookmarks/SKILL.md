@@ -97,10 +97,16 @@ browser-use --cdp-url http://127.0.0.1:9222 eval "
     const statusUrl = statusHref ? ('https://x.com' + statusHref) : null;
     // Article detection: X Articles do NOT expose /article/ URLs on the bookmarks
     // page. They are reached via the same status URL as a regular tweet — X
-    // redirects that URL to the article view. The distinguishing marker is the
-    // article cover-image testid inside the tile.
+    // redirects that URL to the article view. The marker is the article-cover-image
+    // testid AND empty tweetText. The cover-image testid alone over-matches by
+    // ~3x (also fires on regular tweets that include a Twitter Card link preview);
+    // the cleanly distinguishing trait is that X Articles render as card-only
+    // tiles with NO tweet body, so combining both keeps the false-positive rate near
+    // zero. Empirically: 151 bookmarks scanned → 42 cover-image hits → 15 true
+    // articles (rest were card-previewing regular tweets).
     const hasArticleCover = !!a.querySelector('[data-testid=\\\"article-cover-image\\\"]');
-    const articleLink = hasArticleCover ? statusUrl : null;
+    const isArticle = hasArticleCover && text.length === 0;
+    const articleLink = isArticle ? statusUrl : null;
     return {author, text: text.slice(0, 800), timeISO, statusUrl, articleLink};
   })
 "

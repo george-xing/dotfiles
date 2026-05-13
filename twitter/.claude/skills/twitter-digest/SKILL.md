@@ -149,12 +149,17 @@ The only mutating actions allowed in step 3. Apply in whatever order the observe
          || a.querySelector('a[href*=\\"/status/\\"]')?.getAttribute('href')
          || null;
        const statusUrl = statusHref ? ('https://x.com' + statusHref) : null;
-       // Article detection: X Articles do NOT expose /article/ URLs anywhere in
-       // For You tiles or bookmarks tiles. They are reached via the same status
-       // URL as a regular tweet — X redirects that URL to the article view.
-       // The distinguishing marker is the article cover-image testid inside the tile.
+       // Article detection: X Articles do NOT expose /article/ URLs in For You
+       // or bookmark tiles. They are reached via the regular status URL — X
+       // redirects to the article view. The marker is article-cover-image testid
+       // AND empty tweetText. The cover-image testid alone over-matches ~3x
+       // (also fires on regular tweets with Twitter Card link previews); X
+       // Articles uniquely render as card-only tiles with NO tweet body, so
+       // combining both keeps false-positive rate near zero. Empirically: 151
+       // bookmarks → 42 cover-image hits → 15 true articles.
        const hasArticleCover = !!a.querySelector('[data-testid=\\"article-cover-image\\"]');
-       const articleLink = hasArticleCover ? statusUrl : null;
+       const isArticle = hasArticleCover && text.length === 0;
+       const articleLink = isArticle ? statusUrl : null;
        const containerText = a.innerText || '';
        const isPromoted = /\\bPromoted\\b|\\bAd\\b(?=$|\\n)/.test(containerText) || !!a.querySelector('[data-testid=\\"placementTracking\\"]');
        return {author, text: text.slice(0, 800), timeISO, statusUrl, articleLink, isPromoted};
