@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pattybot.credit-card-offers</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/pattybot/dotfiles/cards/bin/cards-fire.sh</string>
+        <string>credit-card-offers</string>
+    </array>
+
+    <!--
+        Single fire per day at 03:00 local time (rationale below):
+
+        - Banks pattern-match high-frequency identical sessions. Daily is
+          slow enough to keep the access profile boring.
+        - 03:00 is off-peak for both Chase and Amex backend systems AND
+          unlikely to compete with the user's daily Chrome on the Mac mini.
+        - Picked local rather than UTC so the fire stays at 03:00 even
+          across DST transitions — launchd interprets StartCalendarInterval
+          in the system's local timezone.
+
+        If the cadence starts triggering kind:challenge regularly, slow
+        down to every 2 days — see runbook.md for the procedure.
+    -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>3</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/pattybot/Library/Logs/credit-card-offers.launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/pattybot/Library/Logs/credit-card-offers.launchd.err.log</string>
+
+    <!--
+        RunAtLoad=false is deliberate. The first fire happens on the next
+        scheduled 03:00 — not when the plist is loaded. Otherwise an
+        accidental launchctl bootstrap mid-day would immediately fire
+        the skill against bank sites during business hours.
+    -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/pattybot</string>
+    </dict>
+
+    <!--
+        ProcessType=Interactive (not Background) is required so cards-fire.sh
+        can script System Events to bring the bot Chrome window foreground.
+        Same rationale as the twitter-digest plist.
+    -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

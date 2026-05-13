@@ -12,7 +12,7 @@ A GNU Stow package (`cards/`) inside `~/dotfiles`. Running `stow -t ~ -R cards` 
 | `bin/cards-prefire.sh` | `~/bin/cards-prefire.sh` |
 | `bin/cards-bot-chrome-setup.sh` | `~/bin/cards-bot-chrome-setup.sh` |
 | `Library/LaunchAgents/com.pattybot.cards-bot-chrome.plist` | `~/Library/LaunchAgents/com.pattybot.cards-bot-chrome.plist` |
-| `Library/LaunchAgents/com.pattybot.credit-card-offers.plist` | `~/Library/LaunchAgents/com.pattybot.credit-card-offers.plist` (phase 4) |
+| `Library/LaunchAgents/com.pattybot.credit-card-offers.plist` | `~/Library/LaunchAgents/com.pattybot.credit-card-offers.plist` |
 | `.claude/skills/credit-card-offers/{SKILL,references/*}.md` | `~/.claude/skills/credit-card-offers/...` |
 
 Editing the symlinked path and editing the file inside this repo are the same operation — both write through to the repo. After altering the directory layout (adding/moving files), rerun `stow -t ~ -R cards` to refresh links.
@@ -24,7 +24,7 @@ There is no build, lint, or test step. The codebase is bash + macOS launchd plis
 Mirrors the twitter package's two-job pattern. Two launchd jobs cooperate:
 
 1. **`com.pattybot.cards-bot-chrome`** — `KeepAlive: true`, runs `Google Chrome.app` with `--user-data-dir=~/Library/Application Support/cards-bot-chrome --remote-debugging-port=19223`. **Always running.** This is the only Chrome the offers skill ever talks to — its persistent profile holds the Chase + Amex session cookies. Coexists with the twitter bot Chrome (9222) and the user's daily Chrome because Chromium's process singleton is keyed on `--user-data-dir`.
-2. **`com.pattybot.credit-card-offers`** — `StartCalendarInterval` at 03:00 PT daily (added in phase 4), fires `bin/cards-fire.sh credit-card-offers`.
+2. **`com.pattybot.credit-card-offers`** — `StartCalendarInterval` at 03:00 local time daily, fires `bin/cards-fire.sh credit-card-offers`. `RunAtLoad=false` so a fresh launchctl-bootstrap doesn't trigger a mid-day fire against bank sites — only the next 03:00.
 
 The fire wrapper is split into two pieces, structurally identical to twitter:
 
@@ -72,14 +72,18 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.cards-bot-c
 ~/dotfiles/cards/bin/cards-prefire.sh
 # Last line: SAVED_FRONTMOST_PID=<pid>
 
-# Smoke-test end-to-end without sending to Telegram (phase 3+)
+# Smoke-test end-to-end without sending to Telegram
 ~/dotfiles/cards/bin/cards-fire.sh credit-card-offers --dry-run
 tail -50 ~/Library/Logs/cards-fire.log
 
 # Manual live fire (sends to Telegram)
 ~/dotfiles/cards/bin/cards-fire.sh credit-card-offers
 
-# Trigger via launchd (same code path as the 03:00 PT fire — phase 4+)
+# Load / unload the daily cron job
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.credit-card-offers.plist
+launchctl bootout   gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.credit-card-offers.plist
+
+# Trigger via launchd (same code path as the 03:00 local fire)
 launchctl kickstart -p gui/$(id -u)/com.pattybot.credit-card-offers
 
 # Daemon Chrome control (NEVER use Cmd-Q or `osascript ... quit` — those
@@ -91,7 +95,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.cards-bot-c
 Logs:
 - `~/Library/Logs/cards-fire.log` — main per-fire log (`===== fire <iso> skill=<name> =====` blocks)
 - `~/Library/Logs/cards-bot-chrome.{out,err}.log` — daemon Chrome stdout/stderr
-- (Phase 4) `~/Library/Logs/credit-card-offers.launchd.{out,err}.log` — launchd-level errors for the daily cron job
+- `~/Library/Logs/credit-card-offers.launchd.{out,err}.log` — launchd-level errors for the daily cron job (PATH / permissions / plist syntax)
 
 ## Editing rules specific to this package
 
