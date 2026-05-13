@@ -336,44 +336,38 @@ EOF
 
 ### 7. Deliver to Telegram
 
-**Critical**: route the digest payload from a file and save Telegram's response to a file too. Do NOT capture the response via shell `$(...)` — the digest contains emoji and non-ASCII text, Telegram echoes it back, and shell interpolation of multi-byte UTF-8 can mangle bytes, causing a local parse error that looks like a send failure and triggers a spurious retry. **Known duplicate-message bug** — if you introduce a shell-var retry path you'll double-send.
+Compose the HTML digest into `$RUN_DIR/digest.html` and a plain-text fallback into `$RUN_DIR/digest.txt` (HTML tags stripped). Then send via the shared helper:
 
 ```bash
 RUN_DIR=/tmp/twitter-digest-run
 mkdir -p "$RUN_DIR"
 
-# The composed HTML digest should already be in $RUN_DIR/digest.html.
+# $DIGEST_HTML and $DIGEST_PLAIN are composed in earlier steps (HTML version
+# uses the Telegram-HTML tags; plain-text version is the same content with
+# tags stripped, used only on parse_mode retry).
+printf '%s' "$DIGEST_HTML"  > "$RUN_DIR/digest.html"
+printf '%s' "$DIGEST_PLAIN" > "$RUN_DIR/digest.txt"
 
-TOKEN=$(grep '^TELEGRAM_BOT_TOKEN=' ~/.claude/channels/telegram/.env | cut -d= -f2-)
-
-curl -sS "https://api.telegram.org/bot${TOKEN}/sendMessage" \
-  -d chat_id=7953915703 \
-  --data-urlencode "text@${RUN_DIR}/digest.html" \
-  -d parse_mode=HTML \
-  -d disable_web_page_preview=true \
-  -o "${RUN_DIR}/tg_response.json"
-CURL_EXIT=$?
-
-OK=$(python3 -c "
-import json, sys
-try:
-    r = json.load(open('${RUN_DIR}/tg_response.json'))
-    print(r.get('ok', False))
-except Exception as e:
-    print('parse_error:' + str(e), file=sys.stderr)
-    print(False)
-")
+TELEGRAM_CHAT_ID=7953915703 \
+TELEGRAM_MESSAGE_FILE="$RUN_DIR/digest.html" \
+TELEGRAM_MESSAGE_PLAIN_FILE="$RUN_DIR/digest.txt" \
+RUN_DIR="$RUN_DIR" \
+  /Users/pattybot/dotfiles/twitter/bin/lib/telegram-send.sh
+TG_EXIT=$?
 ```
 
-**Retry ONLY on `OK=False` with a well-formed JSON response (Telegram said `ok: false`).** Do NOT retry on:
-- curl non-zero exit (network error — retry useless if network is down)
-- Local Python parse errors (shell-encoding artifacts, not send failures)
-- Empty response file (transport issue, not payload)
+The helper enforces the load-bearing invariants from prior production incidents:
 
-If `OK=False` with a real Telegram error:
-- Inspect description. Common: "can't parse entities" (HTML tag slipped through unescaped), "message is too long" (>4096 chars).
-- One retry, plain-text fallback: strip HTML tags from `digest.html` to produce `digest.txt`, drop `parse_mode`, re-send with `--data-urlencode "text@${RUN_DIR}/digest.txt"`.
-- If retry also returns `ok: false`: write the failure to `state/last-failure.json` and STOP. Do not send another Telegram alert.
+- **File-payload only**: `--data-urlencode "text@<file>"`, NEVER `text="$DIGEST_HTML"` from a shell var. Multi-byte UTF-8 in emoji content can be mangled by shell interpolation, producing what looks like a send failure and triggering a spurious retry → the duplicate-message bug.
+- **Retry only on parseable `ok: false`**: never on curl non-zero exit (network error), never on local Python parse errors (shell-encoding artifacts, not send failures), never on empty response.
+- **One retry, plain-text fallback**: strips HTML by re-sending with `disable parse_mode` against `digest.txt`.
+
+Inspect the helper at `/Users/pattybot/dotfiles/twitter/bin/lib/telegram-send.sh` for the full implementation.
+
+**On `$TG_EXIT`:**
+- `0` — sent successfully (HTML or plain-text fallback). Proceed to step 8.
+- `1` — Telegram returned `ok: false` even after plain-text retry. Write `state/last-failure.json` with `kind: telegram` (description from `$RUN_DIR/tg_response.json`). STOP. Do NOT send another Telegram message about the failure.
+- `2` — curl/network/local-parse failure. Same handling as `kind: telegram` but with a network-error message in the failure JSON.
 
 ### 8. On success: atomic finalize + persist digested URLs
 
@@ -390,29 +384,15 @@ d['telegramOk'] = True
 json.dump(d, open('$PENDING.tmp', 'w'))
 " && mv "$PENDING.tmp" "$LAST_SUCCESS" && rm -f "$PENDING"
 
-# Append the URLs of summarized bullets (NOT every URL scanned), prune entries older than 7 days.
-# $SUMMARIZED_URLS_JSON should be a JSON array of statusUrls that actually shipped in this digest.
-python3 - <<PY
-import json, os
-from datetime import datetime, timedelta, timezone
-path = os.path.expanduser('$DIGESTED_URLS')
-now = datetime.now(timezone.utc)
-cutoff = now - timedelta(days=7)
-existing = []
-if os.path.exists(path) and os.path.getsize(path):
-    existing = json.load(open(path))
-existing = [e for e in existing if datetime.fromisoformat(e['digestedAt']) >= cutoff]
-new_urls = json.loads(os.environ.get('SUMMARIZED_URLS_JSON', '[]'))
-seen_urls = {e['url'] for e in existing}
-for u in new_urls:
-    if u and u not in seen_urls:
-        existing.append({'url': u, 'digestedAt': now.isoformat()})
-        seen_urls.add(u)
-json.dump(existing, open(path + '.tmp', 'w'))
-os.replace(path + '.tmp', path)
-print(f"digested-urls now has {len(existing)} entries")
-PY
+# Append URLs of summarized bullets (NOT every URL scanned), prune entries older than 7 days.
+# $SUMMARIZED_URLS_JSON is the JSON array of statusUrls that actually shipped in this digest.
+DEDUP_FILE="$DIGESTED_URLS" \
+DEDUP_URLS_JSON="$SUMMARIZED_URLS_JSON" \
+DEDUP_TTL_DAYS=7 \
+  /Users/pattybot/dotfiles/twitter/bin/lib/dedup-append.sh
 ```
+
+The helper handles idempotent appends (duplicate URLs not re-added), TTL prune (entries older than 7 days dropped), and atomic write via PID-suffixed tmp + os.replace. Inspect at `/Users/pattybot/dotfiles/twitter/bin/lib/dedup-append.sh`.
 
 **Do NOT** call `browser-use close --all` — the daemon Chrome is launchd-managed and must keep running. Closing it would force a daemon respawn and lose the active tab state.
 
