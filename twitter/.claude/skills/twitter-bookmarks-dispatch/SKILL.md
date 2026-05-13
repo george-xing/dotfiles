@@ -88,20 +88,43 @@ When the background Agent finishes, the parent session is notified with the Agen
 LAST_FAILURE=~/.claude/skills/twitter-bookmarks/state/last-failure.json
 
 if [ -f "$LAST_FAILURE" ]; then
-  FAILURE_AT=$(python3 -c "import json; print(json.load(open('$LAST_FAILURE')).get('at',''))" 2>/dev/null)
-  if [ -n "$FAILURE_AT" ] && [ "$FAILURE_AT" \> "$DISPATCH_AT_ISO" ]; then
-    KIND=$(python3 -c "import json; print(json.load(open('$LAST_FAILURE')).get('kind','unknown'))")
-    MSG=$(python3 -c "import json; print(json.load(open('$LAST_FAILURE')).get('message','no message'))")
-    echo "RELAY: kind=$KIND msg=$MSG"
-  else
-    echo "ok: failure file is stale (from prior run)"
-  fi
+  # Compare via Python so it works in both bash and zsh (zsh's [ \> ] doesn't
+  # do string compare), and pass timestamps via env vars to avoid shell quoting
+  # issues if either value contains special chars.
+  RELAY_DECISION=$(LF_PATH="$LAST_FAILURE" D_AT="$DISPATCH_AT_ISO" python3 <<'PY'
+import json, os
+try:
+    with open(os.environ["LF_PATH"]) as f:
+        data = json.load(f)
+    fa = data.get("at", "")
+    da = os.environ.get("D_AT", "")
+    if fa and da and fa > da:
+        print(f"RELAY|{data.get('kind','unknown')}|{data.get('message','no message')}")
+    else:
+        print("STALE")
+except Exception as e:
+    print(f"ERROR|{e}")
+PY
+)
+  case "$RELAY_DECISION" in
+    RELAY\|*)
+      KIND=$(echo "$RELAY_DECISION" | cut -d'|' -f2)
+      MSG=$(echo "$RELAY_DECISION" | cut -d'|' -f3-)
+      echo "RELAY: kind=$KIND msg=$MSG"
+      ;;
+    STALE)
+      echo "ok: failure file is stale (from prior run)"
+      ;;
+    *)
+      echo "ok: failure-file read error ($RELAY_DECISION)"
+      ;;
+  esac
 else
   echo "ok"
 fi
 ```
 
-Use ISO-8601 lexicographic comparison (`"$FAILURE_AT" \> "$DISPATCH_AT_ISO"`) — ISO timestamps sort correctly as strings.
+The comparison goes through Python's string `>` on ISO-8601 UTC timestamps — both `twitter-fire.sh` and the bookmark skill emit `+00:00`-suffixed UTC, so lexicographic ordering is equivalent to chronological ordering. Doing the compare in Python sidesteps shell test-operator differences (zsh's `[ ... ]` does NOT support `\>` for strings, but bash does).
 
 If `RELAY: ...`: use the MCP `reply` tool to send:
 
@@ -120,5 +143,5 @@ If `ok: ...`: nothing further — the user already received the digest in Telegr
 - **Don't have the Agent acquire its own flock.** `twitter-fire.sh` does that. Adding another lock layer would deadlock or race.
 - **Don't relay successful runs back to Telegram.** The digest message itself is the success signal.
 - **Don't retry on Agent failure.** The failure-kind is informational; retry is the operator's choice.
-- **Don't use file mtime for failure detection.** Use the `at` field inside `last-failure.json` compared against the dispatch start timestamp. A stale failure file's mtime can be confusing; the JSON's own `at` is what the skill wrote.
+- **Don't use file mtime for failure detection.** Use the `at` field inside `last-failure.json` compared against the dispatch start timestamp. A stale failure file's mtime can be confusing; the JSON's own `at` is what the skill wrote. Compare via Python (env-var form above), not shell test operators — `[ "$a" \> "$b" ]` works in bash but NOT in zsh.
 - **Don't try to handle the case where no paired session exists.** This skill only runs WHEN a paired session is active. If the user DMs `/bookmarks` and no session is paired, the Telegram plugin queues the notification with no consumer — that's a documented limitation in the bookmark runbook, not something this skill can address.
