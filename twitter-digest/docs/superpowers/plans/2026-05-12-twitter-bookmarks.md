@@ -386,16 +386,16 @@ Create `~/dotfiles/twitter/bin/twitter-fire.sh` with this content:
 
 set -uo pipefail
 
+export HOME="/Users/pattybot"
+export PATH="/opt/homebrew/bin:/usr/local/bin:/Users/pattybot/.local/bin:/Users/pattybot/.npm-global/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export LANG="en_US.UTF-8"
+export LC_ALL="en_US.UTF-8"
+
 CLAUDE_BIN="/Users/pattybot/.local/bin/claude"
 BROWSER_USE_BIN="/Users/pattybot/.local/bin/browser-use"
 NODE_BIN="/opt/homebrew/bin/node"
 PREFIRE_BIN="$(dirname "$(realpath "$0")")/twitter-prefire.sh"
 LOCK_FILE="$HOME/.claude/skills/.twitter-fire.lock"
-
-export PATH="/opt/homebrew/bin:/usr/local/bin:/Users/pattybot/.local/bin:/Users/pattybot/.npm-global/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-export LANG="en_US.UTF-8"
-export LC_ALL="en_US.UTF-8"
-export HOME="/Users/pattybot"
 
 LOG="$HOME/Library/Logs/twitter-fire.log"
 mkdir -p "$(dirname "$LOG")"
@@ -575,13 +575,12 @@ with:
 ```xml
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>-c</string>
-        <string>/Users/pattybot/dotfiles/twitter/bin/twitter-fire.sh twitter-digest</string>
+        <string>/Users/pattybot/dotfiles/twitter/bin/twitter-fire.sh</string>
+        <string>twitter-digest</string>
     </array>
 ```
 
-The bash -c form is needed because launchd doesn't shell-tokenize ProgramArguments — without it, "twitter-digest" would be appended as a separate argv element rather than the skill name argument to the wrapper.
+Each `<string>` in `ProgramArguments` is one argv element — argv[0] is the wrapper, argv[1] is the skill name. No shell wrapper needed.
 
 - [ ] **Step 4: Reload the plist**
 
@@ -591,7 +590,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.twitter-dig
 launchctl print gui/$(id -u)/com.pattybot.twitter-digest | grep -E 'program|arguments' | head -5
 ```
 
-Expected: `program = /bin/bash` and arguments include the wrapper path + `twitter-digest`.
+Expected: `program = /Users/pattybot/dotfiles/twitter/bin/twitter-fire.sh` and `arguments = { twitter-fire.sh, twitter-digest }`.
 
 - [ ] **Step 5: Manual gate — launchctl kickstart smoke test**
 
@@ -905,7 +904,9 @@ for u in new_urls:
         existing.append({"url": u, "digestedAt": now.isoformat()})
         seen.add(u)
 
-tmp = path + ".tmp"
+# PID-suffixed tmp to avoid races if two writers ever touch the same file
+# (shouldn't happen under flock, but cheap insurance against future regressions).
+tmp = f"{path}.tmp.{os.getpid()}"
 with open(tmp, "w") as f:
     json.dump(existing, f)
 os.replace(tmp, path)
@@ -1132,12 +1133,14 @@ Create `~/dotfiles/twitter/.claude/skills/twitter-bookmarks/SKILL.md`:
 ````markdown
 ---
 name: twitter-bookmarks
-description: Generate an X bookmark digest — attaches via CDP to the long-running bot Chrome daemon (launchctl-managed, persistent profile, debug port 9222), navigates to x.com/i/bookmarks, scrolls until ~150 substantive bookmarks accumulated OR a ~2-month save-date heuristic hits OR plateau, summarizes new bookmarks since last fire (with persistent URL dedup — no TTL), separately summarizes any long-form X Articles, and delivers to Telegram. Use when the user asks for "bookmarks digest", "summarize my bookmarks", "/bookmarks", "read my bookmarks", or when fired by the paired-session dispatch skill.
+description: Generate an X bookmark digest — attaches via CDP to the long-running bot Chrome daemon (launchctl-managed, persistent profile, debug port 9222), navigates to x.com/i/bookmarks, scrolls until ~150 substantive bookmarks accumulated OR a ~2-month tweet-age heuristic trips OR plateau, summarizes new bookmarks since last fire (with persistent URL dedup — no TTL), separately summarizes any long-form X Articles, and delivers to Telegram. Use when the user asks for "bookmarks digest", "summarize my bookmarks", "/bookmarks", "read my bookmarks", or when fired by the paired-session dispatch skill.
 ---
 
 # Twitter Bookmarks Digest
 
-On-demand job: attach to the persistent bot Chrome on `127.0.0.1:9222`, navigate to `x.com/i/bookmarks`, scrape new bookmarks since the last fire, summarize them + any X Articles, deliver to Telegram. Persistent dedup means each bookmark is summarized exactly once, forever. The first fire after the skill is created uses a ~2-month save-date heuristic to bound the initial backlog; subsequent fires only surface newly-saved bookmarks.
+On-demand job: attach to the persistent bot Chrome on `127.0.0.1:9222`, navigate to `x.com/i/bookmarks`, scrape new bookmarks since the last fire, summarize them + any X Articles, deliver to Telegram. Persistent dedup means each bookmark is summarized exactly once, forever. The first fire uses a ~2-month tweet-age heuristic to bound the initial backlog; subsequent fires only surface newly-saved bookmarks via URL dedup.
+
+**Important: the bookmarks page DOM exposes the tweet's authored date (`time[datetime]`), NOT the bookmark save date.** The heuristic uses tweet age as an approximation of save age — it works because the bookmarks page is sorted reverse-chronologically by save date, AND because most bookmarks are saved within a short window of the tweet's posting. Edge case: someone who recently bookmarks a very old tweet (e.g., a 2-year-old essay) will see that bookmark trip the heuristic prematurely. Accepted tradeoff — the first-fire seeds dedup against everything visible, so a re-fire isn't catastrophic. The 150-item count cap is the primary stop; tweet-age is the backup.
 
 ## Inputs (from environment / state)
 
@@ -1162,7 +1165,7 @@ print(n)
 echo "digested-urls in dedup set: $DIGESTED_COUNT"
 ```
 
-If `DIGESTED_COUNT == 0` this is the first (seed) fire — apply the 2-month save-date heuristic to bound the initial backlog.
+If `DIGESTED_COUNT == 0` this is the first (seed) fire — apply the 2-month tweet-age heuristic to bound the initial backlog. (See top-of-file note on why tweet-age is an approximation of save-age, not a precise mapping.)
 
 ### 2. Attach to daemon Chrome, navigate to bookmarks, verify
 
@@ -1189,8 +1192,8 @@ Expected: `vis === "visible"`, `iw > 0`, `ih > 0`, `title` includes "Bookmark", 
 
 **Stop on whichever first**:
 
-1. **~150 substantive bookmarks** in `seen` accumulator.
-2. **~10 consecutive bookmarks dated older than 2 months ago** (save-date heuristic on first fire only — when `DIGESTED_COUNT == 0`).
+1. **~150 substantive bookmarks** in `seen` accumulator (primary stop).
+2. **~10 consecutive bookmarks whose tweet authored date is older than 2 months ago** (tweet-age heuristic on first fire only — when `DIGESTED_COUNT == 0`; backup stop).
 3. **URL dedup**: 5+ consecutive already-summarized URLs (you've scrolled past everything new since last fire).
 4. **Wall budget**: 5 minutes elapsed.
 5. **Plateau**: 3 consecutive zero-new scroll iterations.
@@ -1234,9 +1237,11 @@ browser-use --cdp-url http://127.0.0.1:9222 eval "
 
 Dedupe by `(author, text)`. Drop entries already in `digested-urls.json` and entries with no `timeISO`.
 
-#### 2-month heuristic (first fire only)
+#### 2-month tweet-age heuristic (first fire only)
 
-After each extraction, check trailing 10 substantive bookmarks. If 10 consecutive have `timeISO` older than 60 days ago, stop scrolling. Bookmarking an old tweet recently doesn't trip this — only a sustained run does.
+After each extraction, check the trailing 10 substantive bookmarks. If 10 consecutive have `timeISO` (the tweet's authored date) older than 60 days ago, stop scrolling — we've likely scrolled into older save-date territory. The "10 consecutive" check makes a single bookmarked-old-tweet not trip this; only a sustained run does.
+
+This is intentionally approximate. The DOM doesn't expose bookmark save date directly; we use tweet age as a proxy because (a) the page is reverse-chronological by save date, and (b) most bookmarks are saved soon after the tweet's posting. The 150-item count cap is the primary defense — this heuristic just keeps a low-volume bookmarker's first fire from running forever.
 
 ### 3a. Stall handling
 
@@ -1557,7 +1562,7 @@ description: Dispatch a twitter-bookmarks fire in response to a Telegram DM. Use
 
 # Twitter Bookmarks Dispatch
 
-Runs in your paired Claude Code session. When a Telegram DM matches a bookmark-trigger phrase, fire this skill to kick off the scrape in the background without blocking the live conversation.
+Runs in your paired Claude Code session. When a Telegram DM matches a bookmark-trigger phrase, fire this skill to kick off the scrape in the background without blocking the live conversation. The actual scrape runs through `twitter-fire.sh twitter-bookmarks` so it inherits the orchestrator's flock + post-fire frontmost restore invariants.
 
 ## Trigger phrases (case-insensitive)
 
@@ -1569,7 +1574,16 @@ Runs in your paired Claude Code session. When a Telegram DM matches a bookmark-t
 
 ## Dispatch workflow
 
-### 1. Check for flock contention
+### 1. Record dispatch start timestamp
+
+For the failure-relay step at the end, we need to know whether any `last-failure.json` was written by THIS dispatch (vs left over from a previous run). Capture an ISO timestamp NOW and remember it for step 5.
+
+```bash
+DISPATCH_AT_ISO=$(python3 -c "from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())")
+echo "dispatch started at: $DISPATCH_AT_ISO"
+```
+
+### 2. Fast-fail flock check (UX optimization)
 
 ```bash
 LOCK=~/.claude/skills/.twitter-fire.lock
@@ -1581,16 +1595,7 @@ else
 fi
 ```
 
-If `BUSY`: reply to Telegram via MCP `reply` tool: `"Bot Chrome busy with another fire (PID <pid>) — try again in ~5 min."` and STOP.
-
-### 2. Run prefire
-
-```bash
-~/dotfiles/twitter/bin/twitter-prefire.sh 2>&1 | tail -10
-PREFIRE_EXIT=${PIPESTATUS[0]}
-```
-
-If `PREFIRE_EXIT != 0`: reply `"Bot Chrome daemon not responding (prefire exit $PREFIRE_EXIT)"` and STOP.
+If `BUSY`: reply to Telegram via MCP `reply` tool: `"Bot Chrome busy with another fire (PID <pid>) — try again in ~5 min."` and STOP. (Note: this is an early-exit optimization for UX. `twitter-fire.sh` would also exit 3 with `kind: busy` if launched against a held lock — but ack'ing "busy" upfront is faster than waiting for the Agent to land and report it.)
 
 ### 3. Ack the trigger
 
@@ -1600,23 +1605,26 @@ Use Telegram `reply` MCP tool. Pass `chat_id` from the inbound `<channel>` block
 🔖 Kicked off — bookmark digest inbound in a few minutes.
 ```
 
-### 4. Launch background Agent
+### 4. Launch background Agent that runs the orchestrator
 
 Use the `Agent` tool with:
 - `subagent_type`: `general-purpose`
 - `run_in_background`: `true`
-- `description`: `Run twitter-bookmarks scrape`
+- `description`: `Run twitter-bookmarks via twitter-fire.sh`
 - `prompt`:
 
 ```
-Run the twitter-bookmarks skill defined at /Users/pattybot/.claude/skills/twitter-bookmarks/SKILL.md. Execute every step described there: attach to daemon Chrome via --cdp-url http://127.0.0.1:9222, navigate to x.com/i/bookmarks, scroll-extract loop using the sanctioned tactic toolkit, pull any X Articles, compose the digest, and deliver to Telegram via the bin/lib/telegram-send.sh helper at chat_id 7953915703.
+Run the command `/Users/pattybot/dotfiles/twitter/bin/twitter-fire.sh twitter-bookmarks` via the Bash tool. Wait for it to complete (~5-10 minutes typical). The wrapper handles its own flock acquisition, prefire foregrounding, claude -p invocation against the bookmark skill, Telegram delivery, and post-fire frontmost restore — you do NOT need to do any of those yourself.
 
-Persistent dedup against ~/.claude/skills/twitter-bookmarks/state/digested-urls.json — no TTL. On success update state/last-success.json and append summarized URLs. On hard fail write state/last-failure.json with {kind, at, message, screenshot?} — the parent session will read it and relay.
+When Bash returns, read the last 30 lines of ~/Library/Logs/twitter-fire.log and return a single sentence summary based on the exit code:
+- exit 0 → "Bookmark fire delivered; see Telegram."
+- exit 3 → "Bookmark fire skipped — flock held by another twitter-fire (busy)."
+- other → "Bookmark fire failed with exit <N>; see ~/.claude/skills/twitter-bookmarks/state/last-failure.json."
 
-You're running OUTSIDE the twitter-fire.sh wrapper, so do NOT acquire the flock — the parent already verified it's free. Do NOT close the daemon Chrome.
-
-Run live (not dry-run). When complete, return a single sentence: "Delivered N bookmark bullets + K article summaries" or "kind:<x> failure, screenshot at <path>".
+Do not call any other tools. Do not narrate progress — one line at the end.
 ```
+
+The Agent's body is a single Bash call with the synchronous `twitter-fire.sh` invocation. Cheap on inference tokens (one tool call, one final sentence), but fire-and-forget from the parent session's perspective.
 
 ### 5. On Agent completion notification
 
@@ -1624,18 +1632,26 @@ When the background Agent finishes:
 
 ```bash
 LAST_FAILURE=~/.claude/skills/twitter-bookmarks/state/last-failure.json
-LAST_SUCCESS=~/.claude/skills/twitter-bookmarks/state/last-success.json
 
-if [ -f "$LAST_FAILURE" ] && [ "$(stat -f %m "$LAST_FAILURE")" -gt "$(stat -f %m "$LAST_SUCCESS" 2>/dev/null || echo 0)" ]; then
-  cat "$LAST_FAILURE"
+# Compare last-failure.json's `at` field against the dispatch start timestamp
+# captured in step 1. Only relay failures written AFTER dispatch started.
+# This is robust even if a stale last-failure.json exists from a prior run.
+if [ -f "$LAST_FAILURE" ]; then
+  FAILURE_AT=$(python3 -c "import json; print(json.load(open('$LAST_FAILURE')).get('at',''))" 2>/dev/null)
+  if [ -n "$FAILURE_AT" ] && [ "$FAILURE_AT" \> "$DISPATCH_AT_ISO" ]; then
+    # Failure is from this dispatch run. Read kind + message for relay.
+    KIND=$(python3 -c "import json; print(json.load(open('$LAST_FAILURE')).get('kind','unknown'))")
+    MSG=$(python3 -c "import json; print(json.load(open('$LAST_FAILURE')).get('message','no message'))")
+    echo "RELAY: kind=$KIND msg=$MSG"
+  else
+    echo "ok: failure file is stale (from prior run)"
+  fi
 else
   echo "ok"
 fi
 ```
 
-If `ok`: nothing further — user got the digest in Telegram already.
-
-If failure JSON newer than last-success: use MCP `reply` to send:
+If `RELAY:`: use MCP `reply` to send:
 
 ```
 ❌ Bookmark fire failed: <kind> — <message>
@@ -1643,12 +1659,15 @@ If failure JSON newer than last-success: use MCP `reply` to send:
 
 One line. User can ask for more.
 
+If `ok:`: nothing further — user got the digest in Telegram already.
+
 ## What NOT to do
 
 - **Don't run inline** — blocks the session for minutes.
-- **Don't acquire the flock yourself** — the background Agent runs without the wrapper.
+- **Don't call prefire or the skill directly** — always go through `twitter-fire.sh` so the flock and post-fire restore invariants apply.
 - **Don't relay successful runs** — the digest message itself is the signal.
 - **Don't retry on Agent failure.**
+- **Don't use file mtime for failure detection** — use the `at` field inside `last-failure.json`. A stale failure file's mtime can be confusing; the timestamp inside the JSON is what the skill itself wrote.
 ````
 
 - [ ] **Step 2: Re-stow**
@@ -1789,5 +1808,5 @@ No inconsistencies.
 1. **Phase A and B each have an unattended-cron gate** with 12-24h wait. Wrapper bugs historically only manifest in launchd-context fires.
 2. **Bookmark skill section 5** does NOT use `references/themes.md` — bookmarks organized into Posts + Articles, not by topic. Intentional.
 3. **Dispatch's `general-purpose` Agent** runs full Claude inference. Token usage scales.
-4. **2-month heuristic is approximate.** Tweets bookmarked recently but originally posted long ago can trip the stop condition prematurely.
+4. **2-month tweet-age heuristic is a save-age approximation.** The DOM exposes the tweet's authored date, NOT the bookmark save date. The bookmark page's reverse-chronological save order + the "10 consecutive" check make this work in practice, but a power user who bookmarks many old essays in a short window could see the heuristic trip prematurely. 150-item count cap is the primary defense.
 5. **Test Telegram messages WILL arrive** in chat 7953915703. Set expectations or use a test chat.
