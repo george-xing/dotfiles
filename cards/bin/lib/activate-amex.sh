@@ -187,15 +187,34 @@ PROBE_JS = """
   result.tile_count = tileWinner ? tileWinner[1] : 0;
   if (result.tile_winner) {
     const tiles = document.querySelectorAll(result.tile_winner);
-    result.tile_samples = Array.from(tiles).slice(0, 3).map(t => ({
-      text: (t.innerText || '').slice(0, 300),
-      buttons: Array.from(t.querySelectorAll('button, [role="button"], a')).map(b => ({
-        tag: b.tagName,
-        text: (b.innerText || '').trim().slice(0, 60),
-        ariaLabel: b.getAttribute('aria-label') || null,
-        dataTest: b.getAttribute('data-test') || b.getAttribute('data-testid') || null
-      }))
-    }));
+    result.tile_samples = Array.from(tiles).slice(0, 3).map(t => {
+      const tileAttrs = {};
+      for (const attr of t.attributes || []) {
+        if (attr.name.startsWith('data-') || attr.name === 'id' || attr.name === 'aria-label') {
+          tileAttrs[attr.name] = attr.value;
+        }
+      }
+      return {
+        text: (t.innerText || '').slice(0, 300),
+        dataAttrs: tileAttrs,
+        outerHTMLPrefix: (t.outerHTML || '').slice(0, 600),
+        buttons: Array.from(t.querySelectorAll('button, [role="button"], a')).map(b => {
+          const bAttrs = {};
+          for (const attr of b.attributes || []) {
+            if (attr.name.startsWith('data-') || attr.name === 'id' || attr.name === 'aria-label' || attr.name === 'href') {
+              bAttrs[attr.name] = attr.value;
+            }
+          }
+          return {
+            tag: b.tagName,
+            text: (b.innerText || '').trim().slice(0, 60),
+            ariaLabel: b.getAttribute('aria-label') || null,
+            dataTest: b.getAttribute('data-test') || b.getAttribute('data-testid') || null,
+            attrs: bAttrs
+          };
+        })
+      };
+    });
   }
   return result;
 })()

@@ -185,15 +185,37 @@ PROBE_JS = """
   result.winner_count = winner ? winner[1] : 0;
   if (result.winner_selector && result.winner_count > 0) {
     const tiles = document.querySelectorAll(result.winner_selector);
-    result.samples = Array.from(tiles).slice(0, 3).map(t => ({
-      text: (t.innerText || '').slice(0, 300),
-      buttons: Array.from(t.querySelectorAll('button, [role="button"], a')).map(b => ({
-        tag: b.tagName,
-        text: (b.innerText || '').trim().slice(0, 60),
-        ariaLabel: b.getAttribute('aria-label') || null,
-        dataTestid: b.getAttribute('data-testid') || null
-      }))
-    }));
+    result.samples = Array.from(tiles).slice(0, 3).map(t => {
+      // Capture every data-* / id / aria-label attr on the tile — one of these
+      // is almost certainly the offer_id key (data-offerid, data-merchant-id,
+      // etc). Saves a second probe pass to discover.
+      const tileAttrs = {};
+      for (const attr of t.attributes || []) {
+        if (attr.name.startsWith('data-') || attr.name === 'id' || attr.name === 'aria-label') {
+          tileAttrs[attr.name] = attr.value;
+        }
+      }
+      return {
+        text: (t.innerText || '').slice(0, 300),
+        dataAttrs: tileAttrs,
+        outerHTMLPrefix: (t.outerHTML || '').slice(0, 600),
+        buttons: Array.from(t.querySelectorAll('button, [role="button"], a')).map(b => {
+          const bAttrs = {};
+          for (const attr of b.attributes || []) {
+            if (attr.name.startsWith('data-') || attr.name === 'id' || attr.name === 'aria-label' || attr.name === 'href') {
+              bAttrs[attr.name] = attr.value;
+            }
+          }
+          return {
+            tag: b.tagName,
+            text: (b.innerText || '').trim().slice(0, 60),
+            ariaLabel: b.getAttribute('aria-label') || null,
+            dataTestid: b.getAttribute('data-testid') || null,
+            attrs: bAttrs
+          };
+        })
+      };
+    });
   }
   return result;
 })()
