@@ -16,7 +16,7 @@ The wrapper auto-foregrounds the bot Chrome window before each fire:
 **TCC permission setup (one-time).** System Events scripting requires macOS Automation permission for the calling process. The launchd-fired bash invocation may not produce a visible TCC prompt the first time (launchd's security context doesn't always surface prompts in the active GUI session). To avoid silent activation skips on the first scheduled fire, **pre-grant the permission interactively before relying on launchd**:
 
 ```bash
-~/bin/twitter-digest-fire.sh --dry-run
+~/dotfiles/twitter/bin/twitter-fire.sh twitter-digest --dry-run
 ```
 
 Run this from your Terminal (or iTerm, etc.). The first time, macOS prompts with *"<Terminal>" wants to control "System Events"* — click **OK**. The permission persists in System Settings → Privacy & Security → Automation. After that, subsequent fires (manual or launchd-triggered) activate silently.
@@ -32,8 +32,8 @@ launchctl kickstart -p gui/$(id -u)/com.pattybot.twitter-digest
 
 Or fire the wrapper directly (skips launchd, still uses the same code path):
 ```bash
-~/bin/twitter-digest-fire.sh            # live — sends to Telegram
-~/bin/twitter-digest-fire.sh --dry-run  # composes digest, prints to log only
+~/dotfiles/twitter/bin/twitter-fire.sh twitter-digest            # live — sends to Telegram
+~/dotfiles/twitter/bin/twitter-fire.sh twitter-digest --dry-run  # composes digest, prints to log only
 ```
 
 Or fire the skill straight from a `claude -p` prompt:
@@ -46,7 +46,7 @@ The wrapper does a 12s health check on `http://127.0.0.1:9222/json/version` befo
 
 ## Logs
 
-- `~/Library/Logs/twitter-digest.log` — main per-fire log. Each fire appends a `===== fire <iso> =====` / `----- exit <N> -----` block.
+- `~/Library/Logs/twitter-fire.log` — main per-fire log for both twitter skills. Each fire appends a `===== fire <iso> skill=<name> =====` / `----- exit <N> -----` block. Renamed from `twitter-digest.log` when the digest plist was switched to `twitter-fire.sh twitter-digest`.
 - `~/Library/Logs/twitter-digest.launchd.{out,err}.log` — launchd-level errors for the fire job (PATH / permissions / plist).
 - `~/Library/Logs/twitter-bot-chrome.{out,err}.log` — the daemon Chrome's stdout/stderr. Useful when debugging why `127.0.0.1:9222` isn't responding.
 
@@ -95,7 +95,7 @@ The skill hard-fails with `last-failure.json {"kind":"auth"}` when the timeline 
 1. Click into the bot Chrome window (it's running 24/7; look for the window with the `twitter-bot-chrome` profile — the URL bar is the easy tell).
 2. Navigate to `https://x.com/i/flow/login` and sign in with your X account.
 3. The cookies persist in `~/Library/Application Support/twitter-bot-chrome/` and survive Chrome restarts.
-4. Manually fire `~/bin/twitter-digest-fire.sh --dry-run` to validate the auth is back.
+4. Manually fire `~/dotfiles/twitter/bin/twitter-fire.sh twitter-digest --dry-run` to validate the auth is back.
 
 No reseed script is needed — the daemon Chrome is the source of truth for cookies, and signing in interactively is the most stealth-correct path (cookies have real `Set-Cookie` provenance, not CDP-imported / dir-copied weirdness).
 
@@ -111,7 +111,7 @@ All failure records may include a `screenshot` field — an absolute path under 
 
 | `kind` in last-failure.json | What happened | Fix |
 |---|---|---|
-| `visibility` | Bot Chrome window not foreground when scrape ran. `vis !== "visible"` after navigation. | The wrapper auto-foregrounds before each fire, so this should be rare. If it recurs, the cause is one of: (a) TCC Automation permission for bash was never granted (check System Settings → Privacy & Security → Automation; bash should appear with System Events checked); (b) the bot Chrome window is on a different macOS Space and activation didn't switch you over (rare — System Events activate usually pulls focus across Spaces); (c) launchd's bash invocation lost the TCC grant after a macOS update; (d) the HDMI dummy plug came loose and the mini reverted to true headless. Re-grant via interactive `~/bin/twitter-digest-fire.sh --dry-run` and respond to the prompt; check `system_profiler SPDisplaysDataType` to confirm the dummy plug is still detected. |
+| `visibility` | Bot Chrome window not foreground when scrape ran. `vis !== "visible"` after navigation. | The wrapper auto-foregrounds before each fire, so this should be rare. If it recurs, the cause is one of: (a) TCC Automation permission for bash was never granted (check System Settings → Privacy & Security → Automation; bash should appear with System Events checked); (b) the bot Chrome window is on a different macOS Space and activation didn't switch you over (rare — System Events activate usually pulls focus across Spaces); (c) launchd's bash invocation lost the TCC grant after a macOS update; (d) the HDMI dummy plug came loose and the mini reverted to true headless. Re-grant via interactive `~/dotfiles/twitter/bin/twitter-fire.sh twitter-digest --dry-run` and respond to the prompt; check `system_profiler SPDisplaysDataType` to confirm the dummy plug is still detected. |
 | `auth` | Login wall — X invalidated the bot's session, or detected mid-run via step 3a screenshot. | Sign in again interactively in the bot Chrome window (see "Re-auth" above). The screenshot in `last-failure.json#screenshot` will show the login wall variant if you want to confirm. |
 | `dom` | Visibility OK, no login wall, but `[data-testid="primaryColumn"]` not found, OR step 3a saw a fundamentally different page chrome. | X UI changed — update the selectors in SKILL.md step 2/3. The screenshot shows what X is rendering now. |
 | `telegram` | Telegram delivery failed even after the plain-text retry. | Check `state/last-failure.json#message` for Telegram's response. Often "message is too long" or "can't parse entities" — fix the compose step. |
@@ -139,8 +139,8 @@ curl -fsS http://127.0.0.1:9222/json/version
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.twitter-digest.plist
 
 # 7. Smoke test
-~/bin/twitter-digest-fire.sh --dry-run
-tail -50 ~/Library/Logs/twitter-digest.log
+~/dotfiles/twitter/bin/twitter-fire.sh twitter-digest --dry-run
+tail -50 ~/Library/Logs/twitter-fire.log
 ```
 
 ## State files
