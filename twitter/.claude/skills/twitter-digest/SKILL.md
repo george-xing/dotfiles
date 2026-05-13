@@ -149,8 +149,12 @@ The only mutating actions allowed in step 3. Apply in whatever order the observe
          || a.querySelector('a[href*=\\"/status/\\"]')?.getAttribute('href')
          || null;
        const statusUrl = statusHref ? ('https://x.com' + statusHref) : null;
-       const articleAnchor = a.querySelector('a[href*=\\"/article/\\"], a[href*=\\"/i/article/\\"]');
-       const articleLink = articleAnchor ? ('https://x.com' + articleAnchor.getAttribute('href')) : null;
+       // Article detection: X Articles do NOT expose /article/ URLs anywhere in
+       // For You tiles or bookmarks tiles. They are reached via the same status
+       // URL as a regular tweet — X redirects that URL to the article view.
+       // The distinguishing marker is the article cover-image testid inside the tile.
+       const hasArticleCover = !!a.querySelector('[data-testid=\\"article-cover-image\\"]');
+       const articleLink = hasArticleCover ? statusUrl : null;
        const containerText = a.innerText || '';
        const isPromoted = /\\bPromoted\\b|\\bAd\\b(?=$|\\n)/.test(containerText) || !!a.querySelector('[data-testid=\\"placementTracking\\"]');
        return {author, text: text.slice(0, 800), timeISO, statusUrl, articleLink, isPromoted};
@@ -188,7 +192,7 @@ The only mutating actions allowed in step 3. Apply in whatever order the observe
 - `[data-testid="User-Name"]` — author block
 - `time[datetime]` — exact ISO timestamp
 - `[role="tablist"] [role="tab"]` — tablist tabs (For You / Following)
-- `/article/` URL pattern — long-form X Articles (may evolve; adapt if you spot a different pattern)
+- `[data-testid="article-cover-image"]` — long-form X Article indicator (inside the tile). Articles do NOT have `/article/` URLs in tiles — they're reached via the same `/status/` URL as a regular tweet, which X redirects to the article view.
 
 ### 3a. Stall handling (screenshot-then-judge)
 
@@ -253,14 +257,16 @@ For each unique `articleLink`:
 browser-use --cdp-url http://127.0.0.1:9222 open "$ARTICLE_URL"
 sleep 3
 browser-use --cdp-url http://127.0.0.1:9222 eval "
-  const bodyEl = document.querySelector('[data-testid=\\"longformText\\"]')
+  const titleEl = document.querySelector('[data-testid=\\"twitter-article-title\\"]')
+              || document.querySelector('h1')
+              || document.querySelector('[data-testid=\\"article-title\\"]');
+  const bodyEl = document.querySelector('[data-testid=\\"twitterArticleRichTextView\\"]')
+              || document.querySelector('[data-testid=\\"longformText\\"]')
               || document.querySelector('[data-testid=\\"article-body\\"]')
               || document.querySelector('article')
               || document.body;
   ({
-    title: document.querySelector('h1')?.innerText
-        || document.querySelector('[data-testid=\\"article-title\\"]')?.innerText
-        || document.title,
+    title: titleEl?.innerText || document.title,
     author: document.querySelector('[data-testid=\\"User-Name\\"]')?.innerText
          || document.querySelector('[data-testid=\\"article-author\\"]')?.innerText
          || '',

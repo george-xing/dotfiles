@@ -95,8 +95,12 @@ browser-use --cdp-url http://127.0.0.1:9222 eval "
       || a.querySelector('a[href*=\\\"/status/\\\"]')?.getAttribute('href')
       || null;
     const statusUrl = statusHref ? ('https://x.com' + statusHref) : null;
-    const articleAnchor = a.querySelector('a[href*=\\\"/article/\\\"], a[href*=\\\"/i/article/\\\"]');
-    const articleLink = articleAnchor ? ('https://x.com' + articleAnchor.getAttribute('href')) : null;
+    // Article detection: X Articles do NOT expose /article/ URLs on the bookmarks
+    // page. They are reached via the same status URL as a regular tweet — X
+    // redirects that URL to the article view. The distinguishing marker is the
+    // article cover-image testid inside the tile.
+    const hasArticleCover = !!a.querySelector('[data-testid=\\\"article-cover-image\\\"]');
+    const articleLink = hasArticleCover ? statusUrl : null;
     return {author, text: text.slice(0, 800), timeISO, statusUrl, articleLink};
   })
 "
@@ -132,14 +136,16 @@ For each unique `articleLink` extracted (typically a handful per fire):
 browser-use --cdp-url http://127.0.0.1:9222 open "$ARTICLE_URL"
 sleep 3
 browser-use --cdp-url http://127.0.0.1:9222 eval "
-  const bodyEl = document.querySelector('[data-testid=\\\"longformText\\\"]')
+  const titleEl = document.querySelector('[data-testid=\\\"twitter-article-title\\\"]')
+              || document.querySelector('h1')
+              || document.querySelector('[data-testid=\\\"article-title\\\"]');
+  const bodyEl = document.querySelector('[data-testid=\\\"twitterArticleRichTextView\\\"]')
+              || document.querySelector('[data-testid=\\\"longformText\\\"]')
               || document.querySelector('[data-testid=\\\"article-body\\\"]')
               || document.querySelector('article')
               || document.body;
   ({
-    title: document.querySelector('h1')?.innerText
-        || document.querySelector('[data-testid=\\\"article-title\\\"]')?.innerText
-        || document.title,
+    title: titleEl?.innerText || document.title,
     author: document.querySelector('[data-testid=\\\"User-Name\\\"]')?.innerText
          || document.querySelector('[data-testid=\\\"article-author\\\"]')?.innerText
          || '',
@@ -148,6 +154,10 @@ browser-use --cdp-url http://127.0.0.1:9222 eval "
   })
 "
 ```
+
+The article extraction selectors in priority order:
+- **Title**: `[data-testid=\"twitter-article-title\"]` is the dedicated X Article title selector (clean, no metadata noise). Fallback to `<h1>` then the older `article-title` testid.
+- **Body**: `[data-testid=\"twitterArticleRichTextView\"]` is the dedicated X Article rich-text body (~8KB of clean prose for typical articles, no view counts or reply pollution). Fallbacks cover older / non-X-Article long-form pages.
 
 Sanity check: if `bodyLen < 500` and the URL resolves to the article, selectors missed the body. Don't summarize from a tiny body — screenshot to `state/stalls/` and emit a one-line "📰 extraction failed" entry, then continue.
 
