@@ -43,8 +43,11 @@ for u in new_urls:
         existing.append({"url": u, "digestedAt": now.isoformat()})
         seen.add(u)
 
-# PID-suffixed tmp so concurrent writers (if the shared flock ever fails)
-# can't clobber each other on the way to os.replace.
+# PID-suffixed tmp + os.replace gives atomic FILE REPLACEMENT but not full
+# read-merge-write atomicity. The wrapper's shlock-based fire mutex
+# (~/.claude/skills/.twitter-fire.lock) is what prevents two writers from
+# racing in the first place — PID suffix is belt-and-braces insurance for
+# the case where this helper is ever invoked standalone outside the wrapper.
 tmp = f"{path}.tmp.{os.getpid()}"
 with open(tmp, "w") as f:
     json.dump(existing, f)

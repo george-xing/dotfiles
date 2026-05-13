@@ -28,13 +28,19 @@ echo "dispatch started at: $DISPATCH_AT_ISO"
 
 Hold `$DISPATCH_AT_ISO` somewhere you can reference after the Agent completes (a `TodoWrite` task description, an in-session variable, etc.).
 
-### 2. Fast-fail flock check (UX optimization)
+### 2. Fast-fail lock check (UX optimization)
+
+`twitter-fire.sh` uses `shlock(1)` for mutual exclusion — the lock file at `~/.claude/skills/.twitter-fire.lock` contains the PID of the holder. To check whether the lock is currently held by a live process:
 
 ```bash
 LOCK=~/.claude/skills/.twitter-fire.lock
-if [ -f "$LOCK" ] && fuser "$LOCK" >/dev/null 2>&1; then
-  HOLDER_PID=$(cat "$LOCK" 2>/dev/null || echo "?")
-  echo "BUSY: holder PID=$HOLDER_PID"
+if [ -f "$LOCK" ]; then
+  HOLDER_PID=$(cat "$LOCK" 2>/dev/null || echo "")
+  if [ -n "$HOLDER_PID" ] && kill -0 "$HOLDER_PID" 2>/dev/null; then
+    echo "BUSY: holder PID=$HOLDER_PID"
+  else
+    echo "FREE (stale lock file; twitter-fire.sh will clean it via shlock)"
+  fi
 else
   echo "FREE"
 fi

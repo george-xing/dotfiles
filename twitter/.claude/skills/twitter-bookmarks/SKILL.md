@@ -220,25 +220,38 @@ TG_EXIT=$?
 - `1` — Telegram returned ok:false even after plain-text retry. Write `state/last-failure.json` with `kind: telegram`, STOP.
 - `2` — curl/network/local-parse failure. Same handling but with network-error message.
 
-### 8. On success: atomic finalize + persist digested URLs
+### 8. On success: persist digested URLs FIRST, then atomic finalize
+
+**Order matters.** Append URLs to `digested-urls.json` BEFORE advancing `last-success.json`. If dedup-append fails after Telegram succeeded, leaving `pending.json` in place gives the operator a forensic marker; a re-fire correctly handles the URLs (URL dedup will dedupe properly when re-shipped). Reversing the order risks duplicate-digest delivery on the next fire.
 
 ```bash
 PENDING=~/.claude/skills/twitter-bookmarks/state/pending.json
 LAST_SUCCESS=~/.claude/skills/twitter-bookmarks/state/last-success.json
 DIGESTED_URLS=~/.claude/skills/twitter-bookmarks/state/digested-urls.json
 
+# Step 8a: persist dedup FIRST.
+# Persistent dedup — DEDUP_TTL_DAYS deliberately omitted (no TTL).
+# $SUMMARIZED_URLS_JSON includes statusUrls AND articleLinks that shipped.
+DEDUP_FILE="$DIGESTED_URLS" \
+DEDUP_URLS_JSON="$SUMMARIZED_URLS_JSON" \
+  /Users/pattybot/dotfiles/twitter/bin/lib/dedup-append.sh
+DEDUP_EXIT=$?
+
+if [ "$DEDUP_EXIT" -ne 0 ]; then
+  # Telegram already shipped; dedup failed. Write last-failure for forensics,
+  # leave pending.json. Do NOT advance last-success.json.
+  echo "{\"kind\":\"dedup\",\"at\":\"$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())')\",\"message\":\"dedup-append.sh exited $DEDUP_EXIT after successful Telegram send; URLs not persisted\"}" \
+    > ~/.claude/skills/twitter-bookmarks/state/last-failure.json
+  exit 1
+fi
+
+# Step 8b: atomic last-success update.
 python3 -c "
 import json
 d = json.load(open('$PENDING'))
 d['telegramOk'] = True
 json.dump(d, open('$PENDING.tmp', 'w'))
 " && mv "$PENDING.tmp" "$LAST_SUCCESS" && rm -f "$PENDING"
-
-# Persistent dedup — DEDUP_TTL_DAYS deliberately omitted (no TTL).
-# $SUMMARIZED_URLS_JSON includes statusUrls AND articleLinks that shipped.
-DEDUP_FILE="$DIGESTED_URLS" \
-DEDUP_URLS_JSON="$SUMMARIZED_URLS_JSON" \
-  /Users/pattybot/dotfiles/twitter/bin/lib/dedup-append.sh
 ```
 
 **Do NOT** call `browser-use close --all` — daemon Chrome is launchd-managed.

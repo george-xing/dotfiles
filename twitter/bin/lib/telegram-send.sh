@@ -98,12 +98,21 @@ import json, sys
 try:
     r = json.load(open('$RESPONSE_FILE'))
     print(r.get('ok', False))
-except Exception:
+except Exception as e:
+    print('parse_error:' + str(e), file=sys.stderr)
     print(False)
-")
+" 2>&1)
 
 if [ "$OK" = "True" ]; then
   exit 0
+fi
+
+# Mirror first-attempt parse-error handling — local parse error on retry response
+# isn't really a Telegram "ok:false"; classify as transport (exit 2) so caller
+# can distinguish from "Telegram explicitly rejected our retry".
+if echo "$OK" | grep -q 'parse_error'; then
+  echo "telegram-send: local parse error on plain-text retry response: $OK" >&2
+  exit 2
 fi
 
 DESC=$(python3 -c "

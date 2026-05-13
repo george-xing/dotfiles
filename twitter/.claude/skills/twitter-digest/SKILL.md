@@ -369,30 +369,41 @@ Inspect the helper at `/Users/pattybot/dotfiles/twitter/bin/lib/telegram-send.sh
 - `1` — Telegram returned `ok: false` even after plain-text retry. Write `state/last-failure.json` with `kind: telegram` (description from `$RUN_DIR/tg_response.json`). STOP. Do NOT send another Telegram message about the failure.
 - `2` — curl/network/local-parse failure. Same handling as `kind: telegram` but with a network-error message in the failure JSON.
 
-### 8. On success: atomic finalize + persist digested URLs
+### 8. On success: persist digested URLs FIRST, then atomic finalize
+
+**Order matters.** Append URLs to `digested-urls.json` BEFORE advancing `last-success.json`. If dedup-append fails between Telegram-succeeded and state-advance, leaving `pending.json` in place gives the operator a forensic marker; a re-fire correctly re-collects the URLs (URL dedup will then dedupe properly when re-shipped). Reversing the order would mark the run "successful" but silently lose the URLs from the dedup set → next fire re-summarizes already-shipped content → duplicate digest delivery.
 
 ```bash
 PENDING=~/.claude/skills/twitter-digest/state/pending.json
 LAST_SUCCESS=~/.claude/skills/twitter-digest/state/last-success.json
 DIGESTED_URLS=~/.claude/skills/twitter-digest/state/digested-urls.json
 
-# Atomic last-success update
+# Step 8a: persist dedup FIRST.
+# $SUMMARIZED_URLS_JSON is the JSON array of statusUrls that actually shipped.
+DEDUP_FILE="$DIGESTED_URLS" \
+DEDUP_URLS_JSON="$SUMMARIZED_URLS_JSON" \
+DEDUP_TTL_DAYS=7 \
+  /Users/pattybot/dotfiles/twitter/bin/lib/dedup-append.sh
+DEDUP_EXIT=$?
+
+if [ "$DEDUP_EXIT" -ne 0 ]; then
+  # Telegram already shipped; dedup failed. Write last-failure for forensics,
+  # leave pending.json in place. Do NOT advance last-success.json.
+  echo "{\"kind\":\"dedup\",\"at\":\"$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())')\",\"message\":\"dedup-append.sh exited $DEDUP_EXIT after successful Telegram send; URLs not persisted\"}" \
+    > ~/.claude/skills/twitter-digest/state/last-failure.json
+  exit 1
+fi
+
+# Step 8b: atomic last-success update.
 python3 -c "
 import json
 d = json.load(open('$PENDING'))
 d['telegramOk'] = True
 json.dump(d, open('$PENDING.tmp', 'w'))
 " && mv "$PENDING.tmp" "$LAST_SUCCESS" && rm -f "$PENDING"
-
-# Append URLs of summarized bullets (NOT every URL scanned), prune entries older than 7 days.
-# $SUMMARIZED_URLS_JSON is the JSON array of statusUrls that actually shipped in this digest.
-DEDUP_FILE="$DIGESTED_URLS" \
-DEDUP_URLS_JSON="$SUMMARIZED_URLS_JSON" \
-DEDUP_TTL_DAYS=7 \
-  /Users/pattybot/dotfiles/twitter/bin/lib/dedup-append.sh
 ```
 
-The helper handles idempotent appends (duplicate URLs not re-added), TTL prune (entries older than 7 days dropped), and atomic write via PID-suffixed tmp + os.replace. Inspect at `/Users/pattybot/dotfiles/twitter/bin/lib/dedup-append.sh`.
+The dedup-append helper handles idempotent appends (duplicate URLs not re-added), TTL prune (entries older than 7 days dropped), and atomic write via PID-suffixed tmp + os.replace. Inspect at `/Users/pattybot/dotfiles/twitter/bin/lib/dedup-append.sh`.
 
 **Do NOT** call `browser-use close --all` — the daemon Chrome is launchd-managed and must keep running. Closing it would force a daemon respawn and lose the active tab state.
 

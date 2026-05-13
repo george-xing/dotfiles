@@ -7,19 +7,21 @@
 #
 # Steps:
 #   1. Validate <skill-name> exists at ~/.claude/skills/<name>/SKILL.md.
-#   2. Acquire shared flock on ~/.claude/skills/.twitter-fire.lock (non-blocking).
-#      Exit 3 if another twitter-fire.sh is currently holding it.
+#   2. Acquire shared lock at ~/.claude/skills/.twitter-fire.lock via shlock(1).
+#      Exit 3 (kind:busy) if another twitter-fire is currently holding it.
 #   3. Call twitter-prefire.sh, capture stdout.
 #   4. Parse SAVED_FRONTMOST_PID and BOT_CHROME_PID from prefire output.
 #   5. Invoke claude -p with the skill prompt (or dry-run variant).
-#   6. Post-fire frontmost restore (only if bot Chrome still frontmost
-#      and SAVED is valid).
-#   7. Exit with claude's exit code.
+#   6. Post-fire frontmost restore (only if bot Chrome still frontmost).
+#   7. Release lock; exit with claude's exit code.
+#
+# All non-zero exits write a kind-tagged ~/.claude/skills/<skill>/state/last-failure.json
+# so the dispatch skill can relay failure to Telegram. Timestamps are UTC ISO-8601
+# to be safely lexicographically comparable across timezones.
 
 set -uo pipefail
 
-# Export env BEFORE any $HOME reference. launchd's default env is minimal;
-# $HOME may be unset until we export it explicitly.
+# Export env BEFORE any $HOME reference. launchd's default env is minimal.
 export HOME="/Users/pattybot"
 export PATH="/opt/homebrew/bin:/usr/local/bin:/Users/pattybot/.local/bin:/Users/pattybot/.npm-global/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export LANG="en_US.UTF-8"
@@ -28,6 +30,8 @@ export LC_ALL="en_US.UTF-8"
 CLAUDE_BIN="/Users/pattybot/.local/bin/claude"
 BROWSER_USE_BIN="/Users/pattybot/.local/bin/browser-use"
 NODE_BIN="/opt/homebrew/bin/node"
+SHLOCK_BIN="/usr/bin/shlock"
+PYTHON_BIN="/usr/bin/python3"
 PREFIRE_BIN="$(dirname "$(realpath "$0")")/twitter-prefire.sh"
 LOCK_FILE="$HOME/.claude/skills/.twitter-fire.lock"
 
@@ -37,6 +41,31 @@ mkdir -p "$(dirname "$LOG")"
 SKILL_NAME="${1:-}"
 DRY_RUN_FLAG="${2:-}"
 
+# UTC ISO timestamp helper — all `at` fields in failure files use this so
+# lexicographic comparisons across producers (wrapper + skill + dispatch) work.
+iso_utc_now() {
+  "$PYTHON_BIN" -c "from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())"
+}
+
+# Write a kind-tagged last-failure.json so dispatch's MCP relay can surface
+# wrapper-side failures (missing binaries, prefire failure, busy) that previously
+# only landed in the log. Skill-name may be empty if the failure is pre-validation.
+write_failure() {
+  local kind="$1"
+  local message="$2"
+  local skill="${3:-$SKILL_NAME}"
+  [ -z "$skill" ] && return 0
+  local state_dir="$HOME/.claude/skills/${skill}/state"
+  mkdir -p "$state_dir" 2>/dev/null || return 0
+  local at
+  at=$(iso_utc_now 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%S+00:00)
+  # JSON-escape message (basic — message is wrapper-controlled so no untrusted content)
+  local esc_msg
+  esc_msg=$(printf '%s' "$message" | "$PYTHON_BIN" -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || printf '"%s"' "$message")
+  printf '{"kind":"%s","at":"%s","message":%s}\n' "$kind" "$at" "$esc_msg" \
+    > "${state_dir}/last-failure.json" 2>/dev/null || true
+}
+
 if [ -z "$SKILL_NAME" ]; then
   echo "usage: twitter-fire.sh <skill-name> [--dry-run]" >&2
   exit 64
@@ -45,51 +74,54 @@ fi
 SKILL_PATH="$HOME/.claude/skills/${SKILL_NAME}/SKILL.md"
 if [ ! -f "$SKILL_PATH" ]; then
   echo "ERROR: skill not found at $SKILL_PATH" >&2
+  write_failure "config" "skill not found at $SKILL_PATH"
   exit 65
 fi
 
 # Sanity: baked-in binaries.
-for bin in "$CLAUDE_BIN" "$BROWSER_USE_BIN" "$NODE_BIN" "$PREFIRE_BIN"; do
+for bin in "$CLAUDE_BIN" "$BROWSER_USE_BIN" "$NODE_BIN" "$SHLOCK_BIN" "$PYTHON_BIN" "$PREFIRE_BIN"; do
   if [ ! -x "$bin" ]; then
     echo "ERROR: missing binary $bin — reinstall or update wrapper paths" >&2
+    write_failure "config" "missing binary $bin"
     exit 127
   fi
 done
 
 mkdir -p "$(dirname "$LOCK_FILE")"
 
-# Acquire flock non-blocking. fd 200 is conventional.
-exec 200>"$LOCK_FILE"
-if ! flock -n 200; then
+# Acquire lock via shlock(1) — macOS-native PID-file locking with built-in
+# stale-PID detection. If lock is held by a live process, exits non-zero.
+# If lock file exists but holder is dead, shlock cleans it and acquires.
+if ! "$SHLOCK_BIN" -p $$ -f "$LOCK_FILE"; then
   HOLDER_PID=$(cat "$LOCK_FILE" 2>/dev/null || echo "?")
-  mkdir -p "$HOME/.claude/skills/${SKILL_NAME}/state" 2>/dev/null || true
-  echo "{\"kind\":\"busy\",\"at\":\"$(date -Iseconds)\",\"message\":\"another twitter-fire in progress (PID $HOLDER_PID)\"}" \
-    > "$HOME/.claude/skills/${SKILL_NAME}/state/last-failure.json" 2>/dev/null || true
+  write_failure "busy" "another twitter-fire in progress (PID $HOLDER_PID)"
   {
-    echo "===== fire $(date -Iseconds) skill=${SKILL_NAME} BUSY ====="
+    echo "===== fire $(iso_utc_now) skill=${SKILL_NAME} BUSY ====="
     echo "  another twitter-fire is holding the lock; holder PID=$HOLDER_PID"
-    echo "----- exit 3 at $(date -Iseconds) -----"
+    echo "----- exit 3 at $(iso_utc_now) -----"
   } >> "$LOG"
   exit 3
 fi
-echo $$ > "$LOCK_FILE"
+
+# Ensure lock is released on any exit path.
+trap 'rm -f "$LOCK_FILE"' EXIT INT TERM
 
 {
-  echo "===== fire $(date -Iseconds) skill=${SKILL_NAME} ====="
+  echo "===== fire $(iso_utc_now) skill=${SKILL_NAME} ====="
 
   # Call prefire, capture stdout for SAVED_FRONTMOST_PID parsing.
   PREFIRE_OUT=$("$PREFIRE_BIN" 2>&1)
   PREFIRE_EXIT=$?
   echo "$PREFIRE_OUT"
   if [ "$PREFIRE_EXIT" -ne 0 ]; then
-    echo "----- exit $PREFIRE_EXIT (prefire failed) at $(date -Iseconds) -----"
+    write_failure "prefire" "twitter-prefire.sh exited $PREFIRE_EXIT (see ~/Library/Logs/twitter-fire.log)"
+    echo "----- exit $PREFIRE_EXIT (prefire failed) at $(iso_utc_now) -----"
     exit $PREFIRE_EXIT
   fi
 
   SAVED_FRONTMOST_PID=$(echo "$PREFIRE_OUT" | grep '^SAVED_FRONTMOST_PID=' | tail -1 | cut -d= -f2)
   BOT_CHROME_PID=$(echo "$PREFIRE_OUT" | grep -oE 'activating bot Chrome PID=[0-9]+' | head -1 | cut -d= -f2)
 
-  # Compose claude -p prompt.
   if [[ "$DRY_RUN_FLAG" == "--dry-run" ]]; then
     PROMPT="Run the ${SKILL_NAME} skill defined in $SKILL_PATH in dry-run mode — execute it as described there but skip the Telegram send and state-file writes."
   else
@@ -102,8 +134,8 @@ echo $$ > "$LOCK_FILE"
 
   # Post-fire frontmost restore. Only if:
   #   1. Saved PID is non-empty.
-  #   2. Saved PID isn't the bot Chrome itself (would be no-op).
-  #   3. Bot Chrome is STILL frontmost (user hasn't manually switched during scrape).
+  #   2. Saved PID isn't the bot Chrome itself.
+  #   3. Bot Chrome is STILL frontmost (user hasn't manually switched).
   if [ -n "$SAVED_FRONTMOST_PID" ] && [ -n "$BOT_CHROME_PID" ] && [ "$SAVED_FRONTMOST_PID" != "$BOT_CHROME_PID" ]; then
     POST_FIRE_FRONTMOST=$(osascript <<OSA 2>/dev/null
 try
@@ -131,6 +163,6 @@ OSA
     fi
   fi
 
-  echo "----- exit $STATUS at $(date -Iseconds) -----"
+  echo "----- exit $STATUS at $(iso_utc_now) -----"
   exit $STATUS
 } >> "$LOG" 2>&1
