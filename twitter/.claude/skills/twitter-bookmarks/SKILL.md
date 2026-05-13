@@ -82,35 +82,18 @@ Identical to twitter-digest's toolkit MINUS the Home-tab refresh click (no equiv
 
 #### Scroll-extract loop
 
-Alternate `window.scrollBy(0, 1500)` and an extraction eval. Pause 1-2s after each scroll for hydration.
+Alternate a scroll and a call to the shared extraction helper. Pause 1-2s after each scroll for hydration.
 
 ```bash
-browser-use --cdp-url http://127.0.0.1:9222 eval "
-  Array.from(document.querySelectorAll('article[data-testid=\\\"tweet\\\"]')).slice(0, 80).map(a => {
-    const author = a.querySelector('[data-testid=\\\"User-Name\\\"]')?.innerText || '';
-    const text = a.querySelector('[data-testid=\\\"tweetText\\\"]')?.innerText || '';
-    const timeEl = a.querySelector('time');
-    const timeISO = timeEl?.getAttribute('datetime') || null;
-    const statusHref = timeEl?.closest('a')?.getAttribute('href')
-      || a.querySelector('a[href*=\\\"/status/\\\"]')?.getAttribute('href')
-      || null;
-    const statusUrl = statusHref ? ('https://x.com' + statusHref) : null;
-    // Article detection: X Articles do NOT expose /article/ URLs on the bookmarks
-    // page. They are reached via the same status URL as a regular tweet — X
-    // redirects that URL to the article view. The marker is the article-cover-image
-    // testid AND empty tweetText. The cover-image testid alone over-matches by
-    // ~3x (also fires on regular tweets that include a Twitter Card link preview);
-    // the cleanly distinguishing trait is that X Articles render as card-only
-    // tiles with NO tweet body, so combining both keeps the false-positive rate near
-    // zero. Empirically: 151 bookmarks scanned → 42 cover-image hits → 15 true
-    // articles (rest were card-previewing regular tweets).
-    const hasArticleCover = !!a.querySelector('[data-testid=\\\"article-cover-image\\\"]');
-    const isArticle = hasArticleCover && text.length === 0;
-    const articleLink = isArticle ? statusUrl : null;
-    return {author, text: text.slice(0, 800), timeISO, statusUrl, articleLink};
-  })
-"
+# Scroll the bookmarks list.
+browser-use --cdp-url http://127.0.0.1:9222 eval "window.scrollBy(0, 1500); 'ok'"
+sleep 1.5
+
+# Extract currently-rendered tiles via the shared helper. Returns clean JSON.
+TILES_JSON=$(MAX=80 /Users/pattybot/dotfiles/twitter/bin/lib/extract-tweets.sh)
 ```
+
+`TILES_JSON` is a JSON array of `{author, text, timeISO, statusUrl, articleLink, isPromoted}`. Inspect `/Users/pattybot/dotfiles/twitter/bin/lib/extract-tweets.sh` for the canonical DOM selectors and the article-detection heuristic (article-cover-image testid AND empty tweetText — combining both eliminates the ~3x false-positive rate that cover-image alone produces on regular tweets with Twitter Card link previews).
 
 Dedupe by `(author, text)`. Drop entries already in `digested-urls.json` and entries with no `timeISO`.
 
@@ -139,33 +122,13 @@ See twitter-digest's SKILL.md 3a for the full classification table (modal/feed-e
 For each unique `articleLink` extracted (typically a handful per fire):
 
 ```bash
-browser-use --cdp-url http://127.0.0.1:9222 open "$ARTICLE_URL"
-sleep 3
-browser-use --cdp-url http://127.0.0.1:9222 eval "
-  const titleEl = document.querySelector('[data-testid=\\\"twitter-article-title\\\"]')
-              || document.querySelector('h1')
-              || document.querySelector('[data-testid=\\\"article-title\\\"]');
-  const bodyEl = document.querySelector('[data-testid=\\\"twitterArticleRichTextView\\\"]')
-              || document.querySelector('[data-testid=\\\"longformText\\\"]')
-              || document.querySelector('[data-testid=\\\"article-body\\\"]')
-              || document.querySelector('article')
-              || document.body;
-  ({
-    title: titleEl?.innerText || document.title,
-    author: document.querySelector('[data-testid=\\\"User-Name\\\"]')?.innerText
-         || document.querySelector('[data-testid=\\\"article-author\\\"]')?.innerText
-         || '',
-    body: bodyEl.innerText.slice(0, 12000),
-    bodyLen: bodyEl.innerText.length
-  })
-"
+ARTICLE_JSON=$(/Users/pattybot/dotfiles/twitter/bin/lib/extract-article.sh "$ARTICLE_URL")
+# ARTICLE_JSON is {title, author, body, bodyLen}.
 ```
 
-The article extraction selectors in priority order:
-- **Title**: `[data-testid=\"twitter-article-title\"]` is the dedicated X Article title selector (clean, no metadata noise). Fallback to `<h1>` then the older `article-title` testid.
-- **Body**: `[data-testid=\"twitterArticleRichTextView\"]` is the dedicated X Article rich-text body (~8KB of clean prose for typical articles, no view counts or reply pollution). Fallbacks cover older / non-X-Article long-form pages.
+The helper navigates the bot Chrome to `$ARTICLE_URL`, sleeps 3s for hydration, then extracts via the dedicated `[data-testid="twitterArticleRichTextView"]` (body) and `[data-testid="twitter-article-title"]` (title) selectors with legacy fallbacks. Returns clean JSON. Inspect `/Users/pattybot/dotfiles/twitter/bin/lib/extract-article.sh` for the full selector fallback chain.
 
-Sanity check: if `bodyLen < 500` and the URL resolves to the article, selectors missed the body. Don't summarize from a tiny body — screenshot to `state/stalls/` and emit a one-line "📰 extraction failed" entry, then continue.
+Sanity check: if `bodyLen < 500` and the URL resolves to the article, the selectors missed the body. Don't summarize from a tiny body — screenshot to `state/stalls/` and emit a one-line "📰 extraction failed" entry, then continue.
 
 After each article, navigate back: `browser-use --cdp-url http://127.0.0.1:9222 open https://x.com/i/bookmarks` (don't try browser history — CDP-detached browsing can get desynced).
 
