@@ -204,19 +204,54 @@ PY
 )
     echo "  pre-fire: cdp un-minimize: $UNMINIMIZE_RESULT"
 
-    # Activate by PID. `with timeout` caps the AppleEvent dispatch so a
-    # hung TCC permission prompt can't block us indefinitely. `try` swallows
-    # the timeout error — we proceed regardless, and the visibility check
-    # in SKILL.md will hard-fail cleanly if activation didn't take.
-    osascript <<OSA 2>/dev/null || true
-try
-  with timeout of 5 seconds
-    tell application "System Events"
-      set frontmost of (first process whose unix id is $BOT_CHROME_PID) to true
-    end tell
-  end timeout
-end try
+    # Pre-warm System Events with a trivial no-op AppleEvent. From a
+    # launchd-spawned context, System Events isn't normally running — the
+    # first AppleEvent triggers macOS's on-demand auto-launch, and the
+    # subsequent real activation call races against that launch, failing
+    # with -1712 (AppleEvent timeout) or -609 (connection invalid). This
+    # pattern was the root cause of every unattended-fire visibility
+    # failure from 2026-05-01 through 2026-05-09 (`ps -eo etime` confirmed
+    # System Events had only just launched at fire time). A trivial pre-
+    # warm completes after the launch settles, so the real activation
+    # below hits a warm process. On interactive runs System Events is
+    # already warm and the pre-warm is a sub-second no-op.
+    osascript >/dev/null 2>&1 <<'OSA' || true
+with timeout of 10 seconds
+  tell application "System Events" to return version
+end timeout
 OSA
+
+    # Activate by PID. `with timeout` caps the AppleEvent dispatch so a
+    # hung TCC permission prompt can't block us indefinitely.
+    #
+    # Timeout is generous (30s, not the 5s we shipped originally) because
+    # launchd-fired runs hit AppleEvent timeout (-1712) on every fire from
+    # 2026-05-01 to 2026-05-09 with the 5s budget — System Events appears
+    # to need significant warm-up when invoked from a long-idle launchd
+    # context (also possibly because the daemon Chrome is App-Nap'd and
+    # slow to ack the activation AppleEvent). Interactive runs settle in
+    # under a second; only unattended ones hit the timeout.
+    #
+    # Diagnostic capture: stderr and exit code are both logged so any
+    # future failure mode (TCC -1719, scripting-bridge errors, etc.) is
+    # immediately visible in the wrapper log without needing to add new
+    # instrumentation. Note: capture exit code BEFORE the `|| true` masks
+    # it — we use a tmpfile rather than command substitution to keep the
+    # exit code intact.
+    OSASCRIPT_ERR_FILE=$(mktemp -t tw-digest-osa.XXXXXX)
+    osascript >/dev/null 2>"$OSASCRIPT_ERR_FILE" <<OSA
+with timeout of 30 seconds
+  tell application "System Events"
+    set frontmost of (first process whose unix id is $BOT_CHROME_PID) to true
+  end tell
+end timeout
+OSA
+    OSASCRIPT_EXIT=$?
+    OSASCRIPT_ERR=$(cat "$OSASCRIPT_ERR_FILE" 2>/dev/null || true)
+    rm -f "$OSASCRIPT_ERR_FILE"
+    if [ "$OSASCRIPT_EXIT" -ne 0 ] || [ -n "$OSASCRIPT_ERR" ]; then
+      echo "  pre-fire: osascript activation exit=$OSASCRIPT_EXIT stderr=${OSASCRIPT_ERR:-<empty>}"
+    fi
 
     # Bounded poll: wait up to 5s for the activation to actually settle.
     # Window activation is async on macOS; a fixed sleep is empirically thin

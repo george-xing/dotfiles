@@ -5,34 +5,33 @@ description: Generate the X (Twitter) digest — attaches via CDP to a long-runn
 
 # Twitter Digest
 
-Twice-daily job: attach to the persistent bot Chrome on `127.0.0.1:9222`, scroll x.com/home, summarize content since the previous run into themes, push to Telegram. The two scheduled fires are 08:00 ET (covers overnight, ~10h window since the prior 22:00 fire) and 22:00 ET (covers daytime, ~14h window since the prior 08:00 fire). Each run reads the cutoff from `state/last-success.json` so the windows automatically hand off to each other without overlap. Designed to be fired headlessly via `claude -p` from launchd, but works fine when invoked interactively.
+Twice-daily job: attach to the persistent bot Chrome on `127.0.0.1:9222`, scroll x.com/home, summarize themed content into Telegram. The two scheduled fires are 08:00 ET (overnight recap) and 22:00 ET (daytime recap). **No time cutoff** — the natural stop signal is URL dedup against `state/digested-urls.json` (we don't repeat anything we've already summarized) + the 3-min wall budget + feed plateau. This mirrors how a human reads X: scroll until you recognize stuff you've already seen, then stop. Designed to be fired headlessly via `claude -p` from launchd, but works fine when invoked interactively.
 
 ## Inputs (from environment / state)
 
 - **Browser**: long-running daemon Chrome managed by the `com.pattybot.twitter-bot-chrome` LaunchAgent, listening on `http://127.0.0.1:9222` for CDP. Persistent user-data-dir at `$HOME/Library/Application Support/twitter-bot-chrome`. Auth state (X cookies) lives in that profile and is set by manual sign-in via the bot Chrome window — NOT by cookie import. **Never spawn a new browser-use Chrome with `--profile` or `--headed` — always attach via `--cdp-url`.**
-- **Lookback window**: read `state/last-success.json#runAt` if present and use as cutoff. Else 12h ago. Cap at 24h regardless.
+- **Lookback**: no time cutoff. URL dedup is the natural stop signal — a human reads until they recognize already-seen content.
+- **URL dedup**: `state/digested-urls.json` is an array of `{url, digestedAt}` entries listing every `statusUrl` actually summarized in a prior run. At extract time, drop any tweet whose `statusUrl` is in this set. After a successful run, append the URLs of summarized bullets and prune entries older than 7 days. (7d TTL is enough — X's For You almost never re-surfaces anything older than ~3 days, so URLs falling out of the dedup set won't realistically come back.)
 - **Telegram bot token**: parse from `~/.claude/channels/telegram/.env` (key `TELEGRAM_BOT_TOKEN`).
 - **Telegram chat_id**: `7953915703`.
 - **Themes**: read `references/themes.md` before composing — edits to that file flow into the next digest with no other change.
 
 ## Workflow
 
-### 1. Read prior state to compute cutoff
+### 1. Load digested-URL dedup set
 
 ```bash
-LAST_SUCCESS=~/.claude/skills/twitter-digest/state/last-success.json
-if [ -s "$LAST_SUCCESS" ]; then
-  CUTOFF_ISO=$(python3 -c "import json; print(json.load(open('$LAST_SUCCESS'))['runAt'])")
-else
-  CUTOFF_ISO=$(python3 -c "from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) - timedelta(hours=12)).isoformat())")
-fi
-# Cap at 24h
-MIN_CUTOFF=$(python3 -c "from datetime import datetime, timedelta, timezone; print((datetime.now(timezone.utc) - timedelta(hours=24)).isoformat())")
-CUTOFF_ISO=$(python3 -c "print(max('$CUTOFF_ISO', '$MIN_CUTOFF'))")
-echo "cutoff: $CUTOFF_ISO"
+DIGESTED_URLS=~/.claude/skills/twitter-digest/state/digested-urls.json
+DIGESTED_COUNT=$(python3 -c "
+import json, os
+p = '$DIGESTED_URLS'
+n = len(json.load(open(p))) if os.path.exists(p) and os.path.getsize(p) else 0
+print(n)
+")
+echo "digested-urls in dedup set: $DIGESTED_COUNT"
 ```
 
-You'll use `CUTOFF_ISO` to recognize when scrolled tweets pass the boundary (X's UI shows relative timestamps like "3h", "1d" — convert mentally).
+There's no time cutoff. Any tweet whose `statusUrl` is in `digested-urls.json` was already summarized in a prior run and gets dropped at extract time; everything else is a candidate. The natural stop signals are: wall budget exhausted, feed plateau, or a stretch of consecutive already-digested URLs (the latter is the human cue "I'm reading stuff I've already read, time to stop").
 
 ### 2. Attach to daemon Chrome and verify
 
@@ -174,8 +173,13 @@ The only mutating actions allowed in step 3. Apply in whatever order the observe
 
 #### Filters
 
-- **Hard filter at extract time**: drop every tweet where `isPromoted === true`. Also drop entries with no `timeISO` — they're typically promoted/structurally-anomalous.
-- **Soft filter at triage time**: marketing / influencer-shill content (see `references/themes.md` → "Triage rules"). The cutoff filter is also a triage-time concern; don't filter at scroll time, since age-derived bullets sometimes still warrant inclusion.
+- **Hard filter at extract time**:
+  - Drop every tweet where `isPromoted === true`.
+  - Drop entries with no `timeISO` — they're typically promoted/structurally-anomalous.
+  - Drop every tweet whose `statusUrl` is in `state/digested-urls.json` — already summarized in a prior run.
+- **Soft filter at triage time**: marketing / influencer-shill content (see `references/themes.md` → "Triage rules"). Also downweight obviously stale content — if a tweet's relative timestamp is "3d" or older AND the substance is time-sensitive (e.g. a "BREAKING:" tweet from days ago, a sports score), drop it. Evergreen content (essays, opinions, references) at any age is fine if it survived URL dedup.
+
+**Note on URL dedup vs. triage**: only *summarized* URLs (the bullets that actually shipped) get added to `digested-urls.json`, NOT every URL we scrolled past. So a tweet that was scraped but dropped in triage one run can be re-evaluated cleanly the next run if the algo re-surfaces it — borderline content gets a second chance to make the cut.
 
 #### Selector reference
 
@@ -371,22 +375,48 @@ If `OK=False` with a real Telegram error:
 - One retry, plain-text fallback: strip HTML tags from `digest.html` to produce `digest.txt`, drop `parse_mode`, re-send with `--data-urlencode "text@${RUN_DIR}/digest.txt"`.
 - If retry also returns `ok: false`: write the failure to `state/last-failure.json` and STOP. Do not send another Telegram alert.
 
-### 8. On success: atomic finalize
+### 8. On success: atomic finalize + persist digested URLs
 
 ```bash
 PENDING=~/.claude/skills/twitter-digest/state/pending.json
 LAST_SUCCESS=~/.claude/skills/twitter-digest/state/last-success.json
+DIGESTED_URLS=~/.claude/skills/twitter-digest/state/digested-urls.json
+
+# Atomic last-success update
 python3 -c "
 import json
 d = json.load(open('$PENDING'))
 d['telegramOk'] = True
 json.dump(d, open('$PENDING.tmp', 'w'))
 " && mv "$PENDING.tmp" "$LAST_SUCCESS" && rm -f "$PENDING"
+
+# Append the URLs of summarized bullets (NOT every URL scanned), prune entries older than 7 days.
+# $SUMMARIZED_URLS_JSON should be a JSON array of statusUrls that actually shipped in this digest.
+python3 - <<PY
+import json, os
+from datetime import datetime, timedelta, timezone
+path = os.path.expanduser('$DIGESTED_URLS')
+now = datetime.now(timezone.utc)
+cutoff = now - timedelta(days=7)
+existing = []
+if os.path.exists(path) and os.path.getsize(path):
+    existing = json.load(open(path))
+existing = [e for e in existing if datetime.fromisoformat(e['digestedAt']) >= cutoff]
+new_urls = json.loads(os.environ.get('SUMMARIZED_URLS_JSON', '[]'))
+seen_urls = {e['url'] for e in existing}
+for u in new_urls:
+    if u and u not in seen_urls:
+        existing.append({'url': u, 'digestedAt': now.isoformat()})
+        seen_urls.add(u)
+json.dump(existing, open(path + '.tmp', 'w'))
+os.replace(path + '.tmp', path)
+print(f"digested-urls now has {len(existing)} entries")
+PY
 ```
 
 **Do NOT** call `browser-use close --all` — the daemon Chrome is launchd-managed and must keep running. Closing it would force a daemon respawn and lose the active tab state.
 
-Note: cutoff for the next run derives from `last-success.json`. `pending.json` is ignored by step 1 — it's only a forensic crumb.
+Note: there's no time cutoff for the next run. `last-success.json` is kept only for forensics and the digest footer; `digested-urls.json` is what prevents repeats. `pending.json` is ignored by step 1 — it's only a forensic crumb.
 
 ## Dry-run mode
 
@@ -404,11 +434,11 @@ Categorize failures and write `state/last-failure.json` with `{kind, at, message
 - `kind: "auth"` — login wall present in the bot Chrome (cookies expired). Operator opens the bot Chrome window, signs into X manually, no reseed script needed. Don't try to log in programmatically — X flags automated logins.
 - `kind: "dom"` — visibility OK, no login wall, but `primaryColumn` missing. Likely an X UI change. Operator updates the selectors in this skill.
 - `kind: "telegram"` — Telegram delivery failed even after the plain-text retry. Captures the response description.
-- `kind: "empty"` — feed truly returned zero tweets in the cutoff window (rare). Treated as success: write `last-success.json` with `tweetCount: 0` so the cutoff advances; send the `Nothing notable 🥱` message.
+- `kind: "empty"` — feed truly returned zero tweets after URL dedup (rare; would mean every tweet shown was already digested in the last 7 days). Treated as success: write `last-success.json` with `tweetCount: 0`; send the `Nothing notable 🥱` message.
 - **Under-target shipping is NOT a failure.** A run that produces 1-49 tweets is still a successful run — it ships the digest, advances `last-success.json`, and writes nothing to `last-failure.json`. The 50-tweet target in step 3 just shapes how patiently to recover from stalls (well below → spend a recovery cap; well above → let plateaus end naturally); it does NOT gate success. Only zero-tweet runs (with all sanctioned tactics tried) advance into the `kind: "empty"` path.
 - `kind: "stall"` — scroll loop stalled and the step-3a screenshot didn't match any recoverable or pre-categorized state. Operator inspects the screenshot at `last-failure.json#screenshot`. Common causes: a new modal variant worth a future Esc-class entry, a rate-limit pattern not yet seen, or an X UI variant the classifier in 3a didn't recognize. After diagnosing, operator may update 3a's classification table and re-fire — the failure-kind taxonomy is intentionally evolving rather than fixed.
 
-In all hard-fail cases, do NOT advance `last-success.json` — the next run must see the same cutoff so it doesn't silently skip the window.
+In all hard-fail cases, do NOT advance `last-success.json` and do NOT append to `digested-urls.json` — a failed run shouldn't mark its un-shipped content as already-summarized.
 
 In all hard-fail cases, do NOT send a Telegram alert about the failure. Operator finds it in the log.
 
