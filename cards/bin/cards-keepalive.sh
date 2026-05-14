@@ -109,6 +109,9 @@ try:
 except json.JSONDecodeError as e:
     print(f"discover_tabs: malformed CDP /json: {e}", file=sys.stderr)
     sys.exit(3)
+if not isinstance(tabs, list):
+    print(f"discover_tabs: /json returned non-list (got {type(tabs).__name__})", file=sys.stderr)
+    sys.exit(3)
 tracked = [
     ("amex",  "americanexpress.com"),
     ("chase", "chase.com"),

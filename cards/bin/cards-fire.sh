@@ -105,7 +105,10 @@ fi
 # while we own the bot Chrome. PID-aware (first whitespace-delimited token).
 FIRE_IN_PROGRESS_LOCK="$HOME/.claude/skills/credit-card-offers/state/fire-in-progress.lock"
 mkdir -p "$(dirname "$FIRE_IN_PROGRESS_LOCK")"
-echo "$$ $(date -u +%FT%TZ)" > "$FIRE_IN_PROGRESS_LOCK"
+# Atomic write: tmp + rename avoids a window where the lock file exists
+# but is mid-truncate/mid-write (keepalive's PID parse would see empty).
+echo "$$ $(date -u +%FT%TZ)" > "$FIRE_IN_PROGRESS_LOCK.tmp.$$" && \
+  mv "$FIRE_IN_PROGRESS_LOCK.tmp.$$" "$FIRE_IN_PROGRESS_LOCK"
 
 # Single combined trap — cleans BOTH locks on any exit path.
 trap 'rm -f "$LOCK_FILE" "$FIRE_IN_PROGRESS_LOCK"' EXIT INT TERM
@@ -202,7 +205,13 @@ for needle, url in targets:
 PY
   }
 
-  park_offers_tabs || true
+  # Skip parking on failure so operator can VNC in and see the failure page
+  # (auth-wall, MFA challenge, etc.). Park only on clean exits.
+  if [[ "$STATUS" == "0" ]]; then
+    park_offers_tabs || true
+  else
+    echo "fire: STATUS=$STATUS, skipping park_offers_tabs (preserve failure state for VNC inspection)" >&2
+  fi
 
   echo "----- exit $STATUS at $(iso_utc_now) -----"
   exit $STATUS
