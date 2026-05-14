@@ -124,6 +124,104 @@ for issuer, needle in tracked:
 PY
 }
 
+# probe_tab WS_URL → prints JSON {"vis":..,"hasPwInput":..,"url":..,"err":..}
+# Runs Page.bringToFront, a tiny randomized scroll, counter-scroll, and a
+# probe_js. Returns "err" non-empty if the websocket failed or eval threw.
+probe_tab() {
+  local ws_url="$1"
+  "$PYTHON_BIN" - "$ws_url" <<'PY'
+import json, sys, time, random
+try:
+    import websocket
+except ImportError:
+    print(json.dumps({"err": "websocket-client missing"}))
+    sys.exit(0)
+
+ws_url = sys.argv[1]
+try:
+    ws = websocket.create_connection(ws_url, suppress_origin=True, timeout=5)
+except Exception as e:
+    print(json.dumps({"err": f"ws connect: {e}"}))
+    sys.exit(0)
+
+_msg_id = [0]
+def cdp(method, params=None, timeout=5):
+    _msg_id[0] += 1
+    mid = _msg_id[0]
+    ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            ws.settimeout(max(0.05, deadline - time.time()))
+            r = json.loads(ws.recv())
+        except Exception as e:
+            return {"error": {"message": f"recv: {e}"}}
+        if r.get("id") == mid:
+            return r
+    return {"error": {"message": "timeout"}}
+
+def evaluate(js):
+    r = cdp("Runtime.evaluate", {"expression": js, "returnByValue": True, "awaitPromise": True})
+    if "error" in r:
+        return None, r["error"]
+    res = r.get("result", {}).get("result", {})
+    if res.get("subtype") == "error":
+        return None, {"message": res.get("description", "js error")}
+    return res.get("value"), None
+
+# Step 1: bring to front (real OS-level activation, not Page.setWebLifecycleState).
+cdp("Page.bringToFront")
+
+# Step 2: small forward scroll (1-3 px randomized).
+scroll_px = 1 + random.randint(0, 2)
+_, err = evaluate(f"window.scrollBy(0, {scroll_px});")
+if err:
+    print(json.dumps({"err": f"scrollBy fwd: {err.get('message')}"}))
+    ws.close()
+    sys.exit(0)
+
+time.sleep(0.25)
+
+# Step 3: counter-scroll to prevent visual drift over time.
+evaluate("window.scrollBy(0, -2);")
+
+# Step 4: probe.
+probe_js = """
+(() => ({
+  vis: document.visibilityState,
+  hasPwInput: !!document.querySelector('input[type="password"]'),
+  url: location.href
+}))()
+"""
+val, err = evaluate(probe_js)
+ws.close()
+if err:
+    print(json.dumps({"err": f"probe eval: {err.get('message')}"}))
+    sys.exit(0)
+val["err"] = ""
+print(json.dumps(val))
+PY
+}
+
+# probe_tab_to_state PROBE_JSON → emits one of: authed, auth-wall, vis-error, dom-error
+probe_tab_to_state() {
+  local probe="$1"
+  "$PYTHON_BIN" - "$probe" <<'PY'
+import json, sys
+p = json.loads(sys.argv[1])
+if p.get("err"):
+    print("dom-error")
+    sys.exit(0)
+if p.get("hasPwInput"):
+    print("auth-wall")
+    sys.exit(0)
+if p.get("vis") != "visible":
+    print("vis-error")
+    sys.exit(0)
+print("authed")
+PY
+}
+
 # ----------------------------------------------------------------------------
 # Selftest harness — runs pure-function assertions and exits.
 # Invoked with: KEEPALIVE_SELFTEST=1 ./cards-keepalive.sh
@@ -191,9 +289,20 @@ if [[ "${KEEPALIVE_SELFTEST:-0}" == "1" ]]; then
   assert_eq "lock: 7d old" \
     "yes" "$(lock_is_stale 1700604800 1700000000 3600)"
 
-  # Pure-function selftests will be added in subsequent tasks.
-  # See: cooldown_should_send (Task 2), state_diff_is_notifiable (Task 3),
-  #      lock_is_stale (Task 4).
+  # probe_tab_to_state(probe_json) → state
+  # Precedence: err > hasPwInput > vis-error > authed.
+  assert_eq "probe: authed" \
+    "authed" "$(probe_tab_to_state '{"vis":"visible","hasPwInput":false,"url":"x","err":""}')"
+  assert_eq "probe: auth-wall (pw input)" \
+    "auth-wall" "$(probe_tab_to_state '{"vis":"visible","hasPwInput":true,"url":"x","err":""}')"
+  assert_eq "probe: vis-error (hidden)" \
+    "vis-error" "$(probe_tab_to_state '{"vis":"hidden","hasPwInput":false,"url":"x","err":""}')"
+  assert_eq "probe: dom-error (ws failed)" \
+    "dom-error" "$(probe_tab_to_state '{"err":"ws connect: refused"}')"
+  assert_eq "probe: err wins over hasPwInput" \
+    "dom-error" "$(probe_tab_to_state '{"vis":"visible","hasPwInput":true,"url":"x","err":"eval failed"}')"
+  assert_eq "probe: pw input wins over vis-error" \
+    "auth-wall" "$(probe_tab_to_state '{"vis":"hidden","hasPwInput":true,"url":"x","err":""}')"
 
   printf "\nselftest: %d/%d passed\n" \
     "$((selftest_total - selftest_failures))" "$selftest_total"
