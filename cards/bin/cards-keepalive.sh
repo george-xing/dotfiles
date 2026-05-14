@@ -527,6 +527,10 @@ mkdir -p "$STATE_DIR" || {
   echo "cards-keepalive: cannot create state dir $STATE_DIR" >&2
   exit 1
 }
+[[ -w "$STATE_DIR" ]] || {
+  echo "cards-keepalive: state dir not writable: $STATE_DIR" >&2
+  exit 1
+}
 
 # 1. Jitter sleep (breaks perfect-cadence pattern).
 sleep $((RANDOM % (JITTER_MAX_SEC + 1)))
