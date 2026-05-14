@@ -165,7 +165,7 @@ from datetime import datetime, timezone, timedelta
 cutoff = datetime.now(timezone.utc) - timedelta(days=1)
 for line in sys.stdin:
     e = json.loads(line)
-    if datetime.fromisoformat(e['ts']) >= cutoff:
+    if datetime.fromisoformat(e['ts'].replace('Z', '+00:00')) >= cutoff:
         print(line.strip())
 "
 
@@ -185,9 +185,9 @@ for issuer in ("amex", "chase"):
     last_authed = None
     for e in issuer_events:
         if e['new'] == 'authed':
-            last_authed = datetime.fromisoformat(e['ts'])
+            last_authed = datetime.fromisoformat(e['ts'].replace('Z', '+00:00'))
         elif e['new'] == 'auth-wall' and last_authed:
-            spans.append((datetime.fromisoformat(e['ts']) - last_authed).total_seconds())
+            spans.append((datetime.fromisoformat(e['ts'].replace('Z', '+00:00')) - last_authed).total_seconds())
             last_authed = None
     if spans:
         spans.sort()

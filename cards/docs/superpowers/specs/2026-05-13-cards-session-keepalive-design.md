@@ -89,7 +89,7 @@ Considered and rejected. The fire runs daily; keepalive runs every 5 min. Co-loc
 **Iteration sequence:**
 
 1. Sleep `$((RANDOM % 60))` for cadence jitter (0–60s).
-2. Check `state/fire-in-progress.lock`. If present and `mtime` < 30 min old → exit 0 silently.
+2. Check `state/fire-in-progress.lock`. PID-alive primary (`kill -0 <pid>`): if the holder is alive AND `mtime` < 60-min cap → exit 0 silently. Otherwise proceed with appropriate log line.
 3. Read tail of `state/keepalive-events.jsonl` (last 2 entries per issuer) to determine `prev` state per issuer.
 4. CDP enumerate: `GET http://127.0.0.1:19223/json` → filter `type=page` tabs by URL substring (`americanexpress.com`, `chase.com`).
 5. For each tracked tab:
@@ -216,7 +216,8 @@ If cooldown blocks: log `throttled`, skip Telegram, but **still append jsonl eve
 03:05:42  keepalive wakes (jitter +42s)         │
 03:05:42  test fire-in-progress.lock → present  │
 03:05:42  stat lock mtime → age 5m 41s          │
-                  → < 30 min → SKIP              │
+                  PID alive + mtime < 60min      │
+                  → SKIP                          │
 03:05:42  exit 0 silently                       │
                                                  │
 03:04:12  fire body completes ◄─────────────────┘
@@ -228,7 +229,7 @@ If cooldown blocks: log `throttled`, skip Telegram, but **still append jsonl eve
 03:10:00  next keepalive iteration — lock gone, proceeds normally
 ```
 
-30-min stale-lock cap means: even if fire OS-kills before trap (power loss, `kill -9`), keepalive resumes within 30 min automatically.
+PID-aware lock coordination (60-min mtime cap fallback) means: even if fire OS-kills before trap (power loss, `kill -9`), keepalive observes a dead PID via `kill -0` and resumes on the next iteration with an `orphan-lock proceed` log entry. The 60-min cap is only the tertiary defense against PID reuse.
 
 ### 6.4 Other flows
 
