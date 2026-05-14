@@ -101,7 +101,14 @@ if ! "$SHLOCK_BIN" -p $$ -f "$LOCK_FILE"; then
   exit 3
 fi
 
-trap 'rm -f "$LOCK_FILE"' EXIT INT TERM
+# fire-in-progress sentinel: tells cards-keepalive.sh to skip iterations
+# while we own the bot Chrome. PID-aware (first whitespace-delimited token).
+FIRE_IN_PROGRESS_LOCK="$HOME/.claude/skills/credit-card-offers/state/fire-in-progress.lock"
+mkdir -p "$(dirname "$FIRE_IN_PROGRESS_LOCK")"
+echo "$$ $(date -u +%FT%TZ)" > "$FIRE_IN_PROGRESS_LOCK"
+
+# Single combined trap — cleans BOTH locks on any exit path.
+trap 'rm -f "$LOCK_FILE" "$FIRE_IN_PROGRESS_LOCK"' EXIT INT TERM
 
 {
   echo "===== fire $(iso_utc_now) skill=${SKILL_NAME} ====="
@@ -158,6 +165,44 @@ OSA
       echo "  post-fire: user moved to PID=$POST_FIRE_FRONTMOST during scrape; not restoring"
     fi
   fi
+
+  # Park Amex and Chase tabs on their offers URLs so the next keepalive
+  # iteration finds them in a stable location. Bounded; best-effort.
+  park_offers_tabs() {
+    /usr/bin/python3 - <<'PY'
+import json, sys, time, urllib.request
+try:
+    import websocket
+except ImportError:
+    print("park_offers_tabs: websocket-client missing", file=sys.stderr); sys.exit(0)
+try:
+    tabs = json.loads(urllib.request.urlopen("http://127.0.0.1:19223/json", timeout=3).read())
+except Exception as e:
+    print(f"park_offers_tabs: cannot list tabs: {e}", file=sys.stderr); sys.exit(0)
+targets = [
+    ("americanexpress.com", "https://global.americanexpress.com/offers/eligible"),
+    ("chase.com",           "https://secure.chase.com/web/auth/dashboard#/dashboard/offers/offerHub"),
+]
+for needle, url in targets:
+    tab = next((t for t in tabs if t.get("type") == "page" and needle in (t.get("url") or "")), None)
+    if not tab:
+        continue
+    try:
+        ws = websocket.create_connection(tab["webSocketDebuggerUrl"], suppress_origin=True, timeout=5)
+        ws.send(json.dumps({"id": 1, "method": "Page.navigate", "params": {"url": url}}))
+        ws.settimeout(5)
+        try:
+            ws.recv()
+        except Exception:
+            pass
+        ws.close()
+    except Exception as e:
+        print(f"park_offers_tabs: nav {needle} failed: {e}", file=sys.stderr)
+    time.sleep(2)
+PY
+  }
+
+  park_offers_tabs || true
 
   echo "----- exit $STATUS at $(iso_utc_now) -----"
   exit $STATUS
