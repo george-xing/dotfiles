@@ -211,28 +211,9 @@ Then *read the image (or text) yourself* and pick the next tactic:
 | Black render, blank page, or screenshot is mostly empty pixels | **Hard-fail `kind: "visibility"`** with the screenshot path. Window dropped foreground or display surface mid-scrape (rare with the dummy plug). |
 | Genuinely uncertain — the screen shows something but you can't classify it confidently | Try one cheap recovery (Esc if cap remaining; else `scrollTo(0, 0)` if cap remaining). If still unclassified after that, **hard-fail `kind: "stall"`** with the screenshot path. |
 
-#### Tactic dispatch details
+#### Tactic dispatch notes
 
-**Escape keystroke** — must be a **native** key event via CDP `Input.dispatchKeyEvent`, not a synthetic `document.dispatchEvent(new KeyboardEvent(...))`. Use `browser-use keys`, which routes through Playwright's input pipeline and produces `event.isTrusted === true`:
-
-```bash
-browser-use --cdp-url http://127.0.0.1:9222 keys "Escape"
-sleep 3
-browser-use --cdp-url http://127.0.0.1:9222 eval "window.scrollTo(0, 0); 'ok'"
-sleep 1
-```
-
-**Why native, not synthetic** — modern X dialogs (Radix/Headless-class components, including the snooze-topics modal) bind `keydown:Escape` on the focused dialog container, not on `document` or `window`. A synthetic `dispatchEvent` on `document` flips `event.isTrusted = false` AND never reaches the dialog's listener path. The May 8 morning run failed exactly this way: synthetic Esc fired twice, the snooze-topics modal stayed up, the feed plateaued at 4 articles. Confirmed by live test that `browser-use keys "Escape"` does dismiss the same modal.
-
-The 3s post-Esc settle is longer than the close animation alone — modals frequently interrupt X's timeline prefetch query, and the feed needs time to re-issue it. The follow-up `scrollTo(0,0)` puts top-of-feed back in viewport, since X's prefetch is gated on top-of-feed visibility. Without these two extra steps, post-Esc runs commonly observe a sparse 5-cell timeline that never rehydrates within the wall budget.
-
-#### Why this toolkit, and only this
-
-- **Esc** — universal human modal-close keystroke; doesn't depend on brittle close-button selectors that drift with each X redesign; no-ops harmlessly on non-modal pages. Capped at 3 per run because deterministic repeated Esc-ing IS a signature.
-- **`scrollTo(0,0)`** — what a human does when a feed feels frozen ("scroll back to top to refresh"). Capped at 3 because a deterministic top-of-feed reset every fire is also a signature.
-- **`scrollBy` / `scrollIntoView`** — uncapped; the digest's primary content-pull mechanism, and any human spends most of their session scrolling.
-
-Stepping outside these — clicking arbitrary buttons (other than the sanctioned setup-time Home-tab click in step 2b and the For-You ensure-active in step 2c), typing, submitting, reloading, navigating away — re-engages the bot-detection risks the skill is engineered to avoid AND would change the digest's source from "what the algorithm surfaced" to "whatever could be backfilled," which defeats the digest's purpose.
+Use native `browser-use keys "Escape"` for modal recovery; never synthesize DOM keyboard events. For the reasoning behind native Escape, tactic caps, and the restricted toolkit, see `/Users/pattybot/.claude/skills/twitter-digest/references/recovery-tactics.md`.
 
 ### 4. Pull long-form articles (after scroll loop ends)
 
@@ -396,15 +377,7 @@ Do NOT call `browser-use close --all` even in dry-run — the daemon Chrome stay
 
 Categorize failures and write `state/last-failure.json` with `{kind, at, message}` plus optional `screenshot` — an absolute path to a CDP-captured PNG of the visible state at failure time. Step 3a always captures screenshots for stall-derived failures; step 4 already does for article-extraction failures; step 2's hard-fails may include them when useful. Operators read the screenshot to disambiguate similar failure modes (e.g. "is this `auth` or `dom`?" — the image makes it obvious).
 
-`kind` values:
-
-- `kind: "visibility"` — bot Chrome window not foreground (`vis !== "visible"` after the CDP `Page.bringToFront` self-recovery attempt also failed). Operator brings the window to front manually and re-fires. Note: `Page.setWebLifecycleState("active")` is still off-limits — that one is real fakery; `Page.bringToFront` is a legitimate OS activation call (page and OS state stay in sync) and is the first thing the skill tries.
-- `kind: "auth"` — login wall present in the bot Chrome (cookies expired). Operator opens the bot Chrome window, signs into X manually, no reseed script needed. Don't try to log in programmatically — X flags automated logins.
-- `kind: "dom"` — visibility OK, no login wall, but `primaryColumn` missing. Likely an X UI change. Operator updates the selectors in this skill.
-- `kind: "telegram"` — Telegram delivery failed even after the plain-text retry. Captures the response description.
-- `kind: "empty"` — feed truly returned zero tweets after URL dedup (rare; would mean every tweet shown was already digested in the last 7 days). Treated as success: write `last-success.json` with `tweetCount: 0`; send the `Nothing notable 🥱` message.
-- **Under-target shipping is NOT a failure.** A run that produces 1-49 tweets is still a successful run — it ships the digest, advances `last-success.json`, and writes nothing to `last-failure.json`. The 50-tweet target in step 3 just shapes how patiently to recover from stalls (well below → spend a recovery cap; well above → let plateaus end naturally); it does NOT gate success. Only zero-tweet runs (with all sanctioned tactics tried) advance into the `kind: "empty"` path.
-- `kind: "stall"` — scroll loop stalled and the step-3a screenshot didn't match any recoverable or pre-categorized state. Operator inspects the screenshot at `last-failure.json#screenshot`. Common causes: a new modal variant worth a future Esc-class entry, a rate-limit pattern not yet seen, or an X UI variant the classifier in 3a didn't recognize. After diagnosing, operator may update 3a's classification table and re-fire — the failure-kind taxonomy is intentionally evolving rather than fixed.
+`kind` values: `visibility`, `auth`, `dom`, `telegram`, `empty`, and `stall`. For the full operator-side taxonomy and recovery expectations, see `/Users/pattybot/.claude/skills/twitter-digest/references/recovery-tactics.md`.
 
 In all hard-fail cases, do NOT advance `last-success.json` and do NOT append to `digested-urls.json` — a failed run shouldn't mark its un-shipped content as already-summarized.
 
@@ -412,13 +385,4 @@ In all hard-fail cases, do NOT send a Telegram alert about the failure. Operator
 
 ## What NOT to do
 
-- **Do not spawn a fresh browser-use Chrome.** Always attach via `--cdp-url http://127.0.0.1:9222`. Spawning would create an ephemeral profile with a different cookie store than the daemon, defeating the entire architecture.
-- **Do not call `browser-use close --all`.** That kills sessions; the daemon Chrome's lifetime is launchd's responsibility, not the skill's.
-- **Do not try to log in programmatically.** X aggressively flags automated logins; operator must sign in manually via the bot Chrome window.
-- **Do not fake the foreground state.** The CDP `Page.setWebLifecycleState("active")` and `Emulation.setVisibleSize` hacks produce a state-mismatch (page lifecycle says active, OS says backgrounded) that's itself detectable. Hard-fail and require operator to actually bring the window foreground.
-- **Stay inside the step-3 sanctioned tactic toolkit.** Only the moves listed in step 3's toolkit are allowed during content-gathering: scroll variants (`scrollBy`, `scrollIntoView`, `scrollTo(0,0)`), `Escape` keystroke, the whitelisted Home-tab click `a[data-testid="AppTabBar_Home_Link"]`, and hard-fail with a categorized kind. Esc and `scrollTo(0,0)` each capped at 3 per run; mid-run Home-tab clicks capped at 2 (the setup-time Home click in step 2b is uncounted). Do NOT switch to inner tabs other than For You (For You is the digest's only source by design). Do NOT click any other buttons by selector — even ones that look obviously dismiss-y like "Got it" / "Skip" / "Continue". Deterministic clicks are a behavioral signature, and auto-clicking "Accept" / "Continue" / "I agree" on TOS, consent, or age-verification modals commits the operator to terms they haven't reviewed. Do NOT type into inputs, submit forms, call `location.reload()`, or navigate away from `x.com/home` (article URL navigation in step 4 is the only sanctioned exception). Stepping outside the toolkit re-engages the bot-detection-and-consent risks the skill is engineered to avoid.
-- **Don't backfill from outside For You.** If the For You feed is sparse, ship what's there — the digest is meant to reflect what X's algorithm surfaced for the user, not a synthetic catch-up assembled from chronological Following or Lists scraping. A thin digest from a real cold-feed day is more honest than a padded one.
-- **Do not hammer X.** If you hit a rate-limit indicator (anywhere — extract response, screenshot, page title), stop scrolling immediately, summarize what you have, deliver, and exit. Don't try to push through with extra Esc/scrollTo/tab-switch; those will only confirm the rate-limit signal.
-- **Do include tweet URLs in the themed sections, but wrapped in the `@author tweeted/posted` attribution link only.** Don't emit a separate URL line.
-- **Do not advance state on Telegram failure.** A failed send must NOT update `last-success.json`.
-- **Do not send a Telegram error message when Telegram itself is the failure.** Log locally and exit.
+See `/Users/pattybot/dotfiles/twitter/CLAUDE.md` section "What 'fixing it' usually does NOT mean" for the canonical rejected-fixes list with full reasoning. Keep new rejected fixes there so this section does not drift.

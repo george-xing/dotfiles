@@ -14,7 +14,7 @@ A single GNU Stow package (`twitter/`) inside `~/dotfiles`. Running `stow -t ~ -
 | `bin/twitter-bot-chrome-setup.sh` | `~/bin/twitter-bot-chrome-setup.sh` |
 | `Library/LaunchAgents/com.pattybot.twitter-bot-chrome.plist` | `~/Library/LaunchAgents/com.pattybot.twitter-bot-chrome.plist` |
 | `Library/LaunchAgents/com.pattybot.twitter-digest.plist` | `~/Library/LaunchAgents/com.pattybot.twitter-digest.plist` |
-| `.claude/skills/twitter-digest/{SKILL,references/*}.md` | `~/.claude/skills/twitter-digest/...` |
+| `.claude/skills/twitter-{digest,bookmarks,bookmarks-dispatch}/...` | `~/.claude/skills/twitter-{digest,bookmarks,bookmarks-dispatch}/...` |
 
 Editing the symlinked path and editing the file inside this repo are the same operation — both write through to the repo. After altering the directory layout (adding/moving files), rerun `stow -t ~ -R twitter` to refresh links.
 
@@ -38,7 +38,7 @@ The skill (`.claude/skills/twitter-digest/SKILL.md`) is the actual work: CDP-att
 
 Two reference files document operational behavior — read them before changing operational behavior:
 
-- `.claude/skills/twitter-digest/SKILL.md` — full step-by-step skill workflow, failure-kind taxonomy, "what NOT to do" list. The operative invariants (no spawned browsers, no `close --all`, no fake foreground state, bounded action set during stall recovery) are spelled out here with their reasoning. **Don't re-decide them.**
+- `.claude/skills/twitter-digest/SKILL.md` — full step-by-step digest workflow. The hot-path operational invariants are inline; explanatory detail lives under `.claude/skills/twitter-digest/references/`.
 - `.claude/skills/twitter-digest/references/runbook.md` — manual-fire commands, daemon control (`launchctl bootout|bootstrap`), TCC permission setup, log paths, re-auth procedure, failure-kind table.
 
 If you find yourself debating an operational decision (clicking a stall modal, retrying on a curl error, calling `browser-use close`), check those files first — odds are the answer is already there with reasoning.
@@ -97,8 +97,8 @@ Operational failures here have a small, well-categorized set of root causes (`vi
 
 1. Read `~/.claude/skills/twitter-digest/state/last-failure.json` and the screenshot it points at.
 2. Match `kind` against the runbook table — most cases need an operator action (re-foreground the window, re-sign-in, update a selector), not a code change.
-3. **Avoid these "fixes" — they were considered and rejected, with reasoning in SKILL.md:**
-   - Faking foreground via CDP `Page.setWebLifecycleState("active")` (mutates page lifecycle only; OS leaves the window backgrounded → page-state and OS-state disagree, which is itself a detectable mismatch). Note: `Page.bringToFront` is **not** rejected — it is the skill's first recovery step on `vis !== "visible"` because it routes through Chromium's `WebContentsImpl::Activate()` → `[NSWindow makeKeyAndOrderFront:]`, the same OS activation path a real user click takes; page and OS state stay in sync. See SKILL.md §"Failure semantics" for the full distinction.
+3. **Avoid these "fixes" — this is the canonical rejected-fixes list with reasoning:**
+   - Faking foreground via CDP `Page.setWebLifecycleState("active")` (mutates page lifecycle only; OS leaves the window backgrounded → page-state and OS-state disagree, which is itself a detectable mismatch). Note: `Page.bringToFront` is **not** rejected — it is the skill's first recovery step on `vis !== "visible"` because it routes through Chromium's `WebContentsImpl::Activate()` → `[NSWindow makeKeyAndOrderFront:]`, the same OS activation path a real user click takes; page and OS state stay in sync.
    - Auto-clicking dismiss-y modal buttons by selector ("Got it", "Continue", "Skip", "Accept").
    - Programmatic X login.
    - Calling `browser-use close --all` anywhere in the flow.

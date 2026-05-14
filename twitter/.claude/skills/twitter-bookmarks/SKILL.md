@@ -1,6 +1,6 @@
 ---
 name: twitter-bookmarks
-description: Generate an X bookmark digest — attaches via CDP to the long-running bot Chrome daemon (launchctl-managed, persistent profile, debug port 9222), navigates to x.com/i/bookmarks, scrolls until ~150 substantive bookmarks accumulated OR a ~2-month tweet-age heuristic trips OR plateau, summarizes new bookmarks since last fire (with persistent URL dedup — no TTL), separately summarizes any long-form X Articles, and delivers to Telegram. Use when the user asks for "bookmarks digest", "summarize my bookmarks", "/bookmarks", "read my bookmarks", or when fired by the paired-session dispatch skill.
+description: Generate an X bookmark digest — attaches via CDP to the long-running bot Chrome daemon (launchctl-managed, persistent profile, debug port 9222), navigates to x.com/i/bookmarks, scrolls until ~150 substantive bookmarks accumulated OR a ~2-month tweet-age heuristic trips OR plateau, summarizes new bookmarks since last fire (with persistent URL dedup — no TTL), separately summarizes any long-form X Articles, and delivers to Telegram. Use when the user asks for "bookmarks digest", "summarize my bookmarks", "/bookmarks", "read my bookmarks", "show me my bookmarks", "what's in my bookmarks", "bookmarks summary", "bookmark roundup", "bookmark recap", or when fired by the paired-session dispatch skill.
 ---
 
 # Twitter Bookmarks Digest
@@ -53,7 +53,7 @@ browser-use --cdp-url http://127.0.0.1:9222 eval "
 
 Expected: `vis === "visible"`, `iw > 0`, `ih > 0`, `title` includes "Bookmark", `hasBookmarkList === true`, `hasLoginWall === false`.
 
-**Failure semantics**: identical to twitter-digest step 2 — same `visibility` / `auth` / `dom` kinds, same `Page.bringToFront` self-recovery for visibility failures. See `~/.claude/skills/twitter-digest/SKILL.md` step 2 for the full failure-handling reference; this skill inherits the same patterns.
+**Failure semantics**: same `visibility` / `auth` / `dom` kinds and same `Page.bringToFront` self-recovery pattern as twitter-digest. See `/Users/pattybot/.claude/skills/twitter-digest/references/shared-operational-patterns.md` section "CDP Attach And Verify" for the stable shared reference.
 
 ### 3. Gather bookmarks
 
@@ -105,7 +105,7 @@ This is intentionally approximate. The DOM doesn't expose bookmark save date dir
 
 ### 3a. Stall handling
 
-Identical to twitter-digest step 3a — screenshot, classify visually, recover or hard-fail. Screenshots persist to `state/stalls/` (last 10 kept):
+Use the shared screenshot-then-judge pattern: capture visual state, classify it, then recover or hard-fail. See `/Users/pattybot/.claude/skills/twitter-digest/references/shared-operational-patterns.md` section "Stall Handling" for the full classification table. Screenshots persist to `state/stalls/` (last 10 kept):
 
 ```bash
 STALLS_DIR=~/.claude/skills/twitter-bookmarks/state/stalls
@@ -115,7 +115,7 @@ browser-use --cdp-url http://127.0.0.1:9222 screenshot "$SCREENSHOT"
 ls -t "$STALLS_DIR"/*.png 2>/dev/null | tail -n +11 | xargs -I {} rm -f {}
 ```
 
-See twitter-digest's SKILL.md 3a for the full classification table (modal/feed-exhausted/auth-wall/dom-changed/etc.) — bookmarks inherits the same recovery decisions.
+Bookmarks inherits the same recovery decisions, with its own screenshot directory.
 
 ### 4. Pull long-form X Articles
 
@@ -194,7 +194,7 @@ RUN_DIR="$RUN_DIR" \
 TG_EXIT=$?
 ```
 
-`$TG_EXIT` handling identical to twitter-digest section 7:
+`$TG_EXIT` handling follows `/Users/pattybot/.claude/skills/twitter-digest/references/shared-operational-patterns.md` section "Telegram Delivery":
 - `0` — sent. Proceed to step 8.
 - `1` — Telegram returned ok:false even after plain-text retry. Write `state/last-failure.json` with `kind: telegram`, STOP.
 - `2` — curl/network/local-parse failure. Same handling but with network-error message.
@@ -254,11 +254,4 @@ In all hard-fail cases, do NOT send a Telegram alert about the failure. Operator
 
 ## What NOT to do
 
-- **Don't spawn a fresh browser-use Chrome.** Always `--cdp-url http://127.0.0.1:9222`.
-- **Don't call `browser-use close --all`.** Daemon Chrome's lifetime is launchd's responsibility.
-- **Don't try to log in programmatically.** X flags automated logins; operator must sign in manually via the bot Chrome window when `kind: auth` fires.
-- **Don't fake foreground state via `setWebLifecycleState`.** The CDP `Page.bringToFront` retry is the only sanctioned self-recovery; `setWebLifecycleState` produces a detectable page-vs-OS state mismatch.
-- **Stay inside the tactic toolkit.** Scroll variants, native Escape, hard-fail. No arbitrary button clicks, no typing, no form submissions, no `location.reload()`.
-- **Don't navigate elsewhere on x.com** except article URLs from step 4. The bookmarks page is the only source.
-- **Don't try to handle non-X external links from bookmarks.** If a bookmark's tweet contains an external link (Twitter t.co or full https URL), summarize the tweet itself; do NOT follow the external link in the bot Chrome. Out of scope.
-- **Don't advance state on Telegram failure.** Failed sends must NOT update `last-success.json` or append to `digested-urls.json`.
+See `/Users/pattybot/dotfiles/twitter/CLAUDE.md` section "What 'fixing it' usually does NOT mean" for the canonical rejected-fixes list with full reasoning. Keep new rejected fixes there so this section does not drift.
