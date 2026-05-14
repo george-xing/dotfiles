@@ -89,6 +89,42 @@ lock_is_stale() {
 }
 
 # ----------------------------------------------------------------------------
+# CDP I/O (impure; smoke-tested via Rung 2 of the validation ladder).
+# ----------------------------------------------------------------------------
+
+# discover_tabs → prints "<issuer>|<ws_url>|<page_url>" lines, one per issuer.
+# ws_url is empty if no matching tab is found OR if the tab has no
+# webSocketDebuggerUrl (rare; service-worker-adjacent tabs). Daemon-unreachable
+# returns exit 2 (curl failure). Malformed JSON from Chrome returns exit 3
+# (treated by main flow as a dom-error event, NOT daemon-down).
+discover_tabs() {
+  local raw
+  if ! raw=$(curl --max-time "$CDP_TIMEOUT_SEC" -fsS "http://127.0.0.1:$DAEMON_PORT/json" 2>/dev/null); then
+    return 2
+  fi
+  "$PYTHON_BIN" - "$raw" <<'PY'
+import json, sys
+try:
+    tabs = json.loads(sys.argv[1])
+except json.JSONDecodeError as e:
+    print(f"discover_tabs: malformed CDP /json: {e}", file=sys.stderr)
+    sys.exit(3)
+tracked = [
+    ("amex",  "americanexpress.com"),
+    ("chase", "chase.com"),
+]
+page_tabs = [t for t in tabs if t.get("type") == "page"]
+for issuer, needle in tracked:
+    match = next((t for t in page_tabs if needle in (t.get("url") or "")), None)
+    # Defensive: a matched tab without webSocketDebuggerUrl is unusable.
+    # Treat as if no tab was found (will emit tab-missing in main flow).
+    ws_url = (match.get("webSocketDebuggerUrl") or "") if match else ""
+    page_url = (match.get("url") or "") if match else ""
+    print(f"{issuer}|{ws_url}|{page_url}")
+PY
+}
+
+# ----------------------------------------------------------------------------
 # Selftest harness — runs pure-function assertions and exits.
 # Invoked with: KEEPALIVE_SELFTEST=1 ./cards-keepalive.sh
 # ----------------------------------------------------------------------------
