@@ -233,6 +233,100 @@ PY
 }
 
 # ----------------------------------------------------------------------------
+# State persistence — append-only JSONL events + atomic cooldown JSON.
+# ----------------------------------------------------------------------------
+
+# last_state_for ISSUER → prints "unknown" if no entry, else the latest "new".
+last_state_for() {
+  local issuer="$1"
+  if [[ ! -f "$EVENTS_FILE" ]]; then
+    echo "unknown"
+    return
+  fi
+  "$PYTHON_BIN" - "$EVENTS_FILE" "$issuer" <<'PY'
+import json, sys
+path, issuer = sys.argv[1], sys.argv[2]
+last = "unknown"
+try:
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if e.get("issuer") == issuer:
+                last = e.get("new", "unknown")
+except FileNotFoundError:
+    pass
+print(last)
+PY
+}
+
+# append_event ISSUER PREV NEW NOTE [SCREENSHOT_PATH]
+# Appends a single JSON line. Caller has already ensured STATE_DIR exists.
+append_event() {
+  local issuer="$1" prev="$2" new="$3" note="$4" screenshot="${5:-}"
+  "$PYTHON_BIN" - "$EVENTS_FILE" "$issuer" "$prev" "$new" "$note" "$screenshot" <<'PY'
+import json, sys, os
+from datetime import datetime, timezone
+path, issuer, prev, new, note, screenshot = sys.argv[1:7]
+entry = {
+    "ts": datetime.now(timezone.utc).isoformat(),
+    "issuer": issuer,
+    "prev": prev,
+    "new": new,
+    "note": note,
+}
+if screenshot:
+    entry["screenshot"] = screenshot
+line = json.dumps(entry) + "\n"
+# Append is line-atomic at <4KB under POSIX.
+with open(path, "a") as f:
+    f.write(line)
+PY
+}
+
+# cooldown_get KEY → prints last-sent ISO timestamp or empty string.
+cooldown_get() {
+  local key="$1"
+  if [[ ! -f "$COOLDOWN_FILE" ]]; then
+    echo ""
+    return
+  fi
+  "$PYTHON_BIN" - "$COOLDOWN_FILE" "$key" <<'PY'
+import json, sys
+path, key = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(path))
+except (FileNotFoundError, json.JSONDecodeError):
+    d = {}
+v = d.get(key)
+print(v if isinstance(v, str) else "")
+PY
+}
+
+# cooldown_set KEY ISO_TS — atomic-write (tmp + rename).
+cooldown_set() {
+  local key="$1" ts="$2"
+  "$PYTHON_BIN" - "$COOLDOWN_FILE" "$key" "$ts" <<'PY'
+import json, os, sys
+path, key, ts = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    d = json.load(open(path))
+except (FileNotFoundError, json.JSONDecodeError):
+    d = {}
+d[key] = ts
+tmp = f"{path}.tmp.{os.getpid()}"
+with open(tmp, "w") as f:
+    json.dump(d, f)
+os.replace(tmp, path)
+PY
+}
+
+# ----------------------------------------------------------------------------
 # Selftest harness — runs pure-function assertions and exits.
 # Invoked with: KEEPALIVE_SELFTEST=1 ./cards-keepalive.sh
 # ----------------------------------------------------------------------------
