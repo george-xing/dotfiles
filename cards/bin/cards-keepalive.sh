@@ -329,6 +329,110 @@ PY
 }
 
 # ----------------------------------------------------------------------------
+# Telegram + screenshots (impure; smoke-tested manually).
+# ----------------------------------------------------------------------------
+
+# capture_screenshot WS_URL ISSUER LABEL → prints absolute screenshot path
+# on success, empty string on failure (best-effort).
+capture_screenshot() {
+  local ws_url="$1" issuer="$2" label="$3"
+  mkdir -p "$SCREENSHOT_DIR"
+  local ts; ts=$(date -u +%Y%m%dT%H%M%SZ)
+  local path="$SCREENSHOT_DIR/keepalive-${label}-${issuer}-${ts}.png"
+  if "$PYTHON_BIN" - "$ws_url" "$path" <<'PY' 2>/dev/null
+import json, os, sys, base64
+try:
+    import websocket
+except ImportError:
+    sys.exit(1)
+ws_url, out = sys.argv[1], sys.argv[2]
+try:
+    ws = websocket.create_connection(ws_url, suppress_origin=True, timeout=5)
+    ws.send(json.dumps({"id": 1, "method": "Page.captureScreenshot", "params": {"format": "png"}}))
+    while True:
+        r = json.loads(ws.recv())
+        if r.get("id") == 1:
+            break
+    b64 = r.get("result", {}).get("data")
+    ws.close()
+    if not b64:
+        sys.exit(1)
+    with open(out, "wb") as f:
+        f.write(base64.b64decode(b64))
+    # Defensive: reject 0-byte files (decode succeeded with empty data).
+    if os.path.getsize(out) == 0:
+        os.unlink(out)
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
+PY
+  then
+    echo "$path"
+  else
+    echo ""
+  fi
+}
+
+# send_telegram_notify ISSUER PREV NEW SCREENSHOT_PATH
+# Returns 0 on Telegram OK, non-zero on send failure.
+# HTML body, escaped per CLAUDE.md (& < > applied last).
+send_telegram_notify() {
+  local issuer="$1" prev="$2" new="$3" screenshot="$4"
+  local now; now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  local issuer_label
+  case "$issuer" in
+    amex)   issuer_label="Amex" ;;
+    chase)  issuer_label="Chase" ;;
+    both)   issuer_label="Both issuers" ;;
+    daemon) issuer_label="Daemon Chrome" ;;
+    *)      issuer_label="$issuer" ;;
+  esac
+
+  local emoji
+  case "$new" in
+    auth-wall)   emoji="🔐" ;;
+    tab-missing) emoji="🗂️"  ;;
+    daemon-down) emoji="💥" ;;
+    *)           emoji="ℹ️"  ;;
+  esac
+
+  local body_html
+  body_html=$(cat <<EOF
+$emoji <b>Cards keepalive — $issuer_label</b>
+
+<b>State:</b> $prev → $new
+<b>At:</b> $now
+<b>Screenshot:</b> $screenshot
+
+<b>Recovery:</b> VNC into Mac mini → cards-bot Chrome (port 19223) → re-login.
+No code change needed; next keepalive iteration will record recovery.
+EOF
+)
+  # Apply HTML escape pipeline LAST so <b> tags survive.
+  local body_escaped
+  body_escaped=$(printf '%s' "$body_html" \
+    | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+  # Restore the few tags we want to use.
+  body_escaped=$(printf '%s' "$body_escaped" \
+    | sed 's|\&lt;b\&gt;|<b>|g; s|\&lt;/b\&gt;|</b>|g')
+
+  local plain
+  plain=$(printf '%s' "$body_html" | sed 's/<[^>]*>//g')
+
+  local run_dir="$STATE_DIR/.keepalive-tg-tmp"
+  mkdir -p "$run_dir"
+  printf '%s' "$body_escaped" > "$run_dir/digest.html"
+  printf '%s' "$plain"        > "$run_dir/digest.txt"
+
+  TELEGRAM_CHAT_ID="$TELEGRAM_CHAT_ID" \
+  TELEGRAM_MESSAGE_FILE="$run_dir/digest.html" \
+  TELEGRAM_MESSAGE_PLAIN_FILE="$run_dir/digest.txt" \
+  RUN_DIR="$run_dir" \
+    "$TELEGRAM_HELPER"
+}
+
+# ----------------------------------------------------------------------------
 # Selftest harness — runs pure-function assertions and exits.
 # Invoked with: KEEPALIVE_SELFTEST=1 ./cards-keepalive.sh
 # ----------------------------------------------------------------------------
