@@ -94,12 +94,12 @@ lock_is_stale() {
 
 # discover_tabs → prints "<issuer>|<ws_url>|<page_url>" lines, one per issuer.
 # ws_url is empty if no matching tab is found OR if the tab has no
-# webSocketDebuggerUrl (rare; service-worker-adjacent tabs). Daemon-unreachable
-# returns exit 2 (curl failure). Malformed JSON from Chrome returns exit 3
-# (treated by main flow as a dom-error event, NOT daemon-down).
+# webSocketDebuggerUrl (rare; service-worker-adjacent tabs). Connection failures
+# (refused, timeout) return exit 2 (daemon-down). HTTP errors AND malformed JSON
+# both return exit 3 (dom-error — Chrome is reachable but not behaving).
 discover_tabs() {
   local raw
-  if ! raw=$(curl --max-time "$CDP_TIMEOUT_SEC" -fsS "http://127.0.0.1:$DAEMON_PORT/json" 2>/dev/null); then
+  if ! raw=$(curl --max-time "$CDP_TIMEOUT_SEC" -sS "http://127.0.0.1:$DAEMON_PORT/json" 2>/dev/null); then
     return 2
   fi
   "$PYTHON_BIN" - "$raw" <<'PY'
