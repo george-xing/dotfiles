@@ -61,6 +61,22 @@ print("yes" if diff >= window_s else "no")
 PY
 }
 
+# state_diff_is_notifiable PREV NEW → "yes" | "no"
+# Notifiable kinds: auth-wall, tab-missing, daemon-down — but only when the
+# transition is INTO that kind (not staying there). Recovery (→authed) and
+# informational kinds (vis-error, dom-error) are silent.
+state_diff_is_notifiable() {
+  local prev="$1" new="$2"
+  if [[ "$prev" == "$new" ]]; then
+    echo "no"
+    return
+  fi
+  case "$new" in
+    auth-wall|tab-missing|daemon-down) echo "yes" ;;
+    *) echo "no" ;;
+  esac
+}
+
 # ----------------------------------------------------------------------------
 # Selftest harness — runs pure-function assertions and exits.
 # Invoked with: KEEPALIVE_SELFTEST=1 ./cards-keepalive.sh
@@ -96,6 +112,26 @@ if [[ "${KEEPALIVE_SELFTEST:-0}" == "1" ]]; then
     "yes" "$(cooldown_should_send '2026-05-14T05:59:59+00:00' '2026-05-14T12:00:00+00:00' 21600)"
   assert_eq "cooldown: exactly 6h (Z suffix, boundary inclusive)" \
     "yes" "$(cooldown_should_send '2026-05-14T06:00:00Z' '2026-05-14T12:00:00+00:00' 21600)"
+
+  # state_diff_is_notifiable(prev, new) → "yes" or "no"
+  assert_eq "diff: unknown→authed (first obs)" \
+    "no" "$(state_diff_is_notifiable unknown authed)"
+  assert_eq "diff: unknown→auth-wall" \
+    "yes" "$(state_diff_is_notifiable unknown auth-wall)"
+  assert_eq "diff: unknown→tab-missing" \
+    "yes" "$(state_diff_is_notifiable unknown tab-missing)"
+  assert_eq "diff: unknown→daemon-down" \
+    "yes" "$(state_diff_is_notifiable unknown daemon-down)"
+  assert_eq "diff: authed→auth-wall" \
+    "yes" "$(state_diff_is_notifiable authed auth-wall)"
+  assert_eq "diff: auth-wall→authed (recovery silent)" \
+    "no" "$(state_diff_is_notifiable auth-wall authed)"
+  assert_eq "diff: auth-wall→auth-wall (no-op)" \
+    "no" "$(state_diff_is_notifiable auth-wall auth-wall)"
+  assert_eq "diff: authed→vis-error (informational)" \
+    "no" "$(state_diff_is_notifiable authed vis-error)"
+  assert_eq "diff: authed→dom-error" \
+    "no" "$(state_diff_is_notifiable authed dom-error)"
 
   # Pure-function selftests will be added in subsequent tasks.
   # See: cooldown_should_send (Task 2), state_diff_is_notifiable (Task 3),
