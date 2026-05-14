@@ -331,18 +331,22 @@ TG_EXIT=$?
 Order matters. Append activated offers to dedup files BEFORE advancing `last-success.json`. If dedup append fails between Telegram-success and state-advance, the operator has `pending.json` as a forensic marker, and a re-fire correctly re-records the offers. Reversing the order would mark the run successful while losing the offer IDs → next fire attempts re-activate → bank's dupe-add behavior is undefined.
 
 ```bash
-AMEX_PAYLOAD=$(/usr/bin/python3 <<'PY'
+# The dedup-append helper takes a JSON array of URL STRINGS (not dicts).
+# It writes entries as {url, digestedAt}; only the URL is persisted, so the
+# composite key must encode everything we'd want to dedup against.
+AMEX_URLS=$(/usr/bin/python3 <<'PY'
 import json
 activated = [
   # ...populated from your loop, each: {"merchant", "deal", "card_id"}...
 ]
-print(json.dumps([{"url": f"{a['card_id']}::{a['merchant']}::{a['deal']}", "merchant": a["merchant"], "deal": a["deal"], "card_id": a["card_id"]} for a in activated]))
+print(json.dumps([f"{a['card_id']}::{a['merchant']}::{a['deal']}" for a in activated]))
 PY
 )
-DEDUP_FILE="$AMEX_ACTIVATED" DEDUP_URLS_JSON="$AMEX_PAYLOAD" /Users/pattybot/dotfiles/twitter/bin/lib/dedup-append.sh
+DEDUP_FILE="$AMEX_ACTIVATED" DEDUP_URLS_JSON="$AMEX_URLS" /Users/pattybot/dotfiles/twitter/bin/lib/dedup-append.sh
 
-# Same shape for Chase; key = "chase::<offer_id_from_url>"
-# CHASE_PAYLOAD=... DEDUP_FILE="$CHASE_ACTIVATED" /Users/pattybot/dotfiles/twitter/bin/lib/dedup-append.sh
+# Chase: key shape `"chase::<offer_id>"` where offer_id is the CDLX:NNN
+# segment from the /offer-activated/<offer_id>?accountId=... URL.
+# CHASE_URLS=... DEDUP_FILE="$CHASE_ACTIVATED" /Users/pattybot/dotfiles/twitter/bin/lib/dedup-append.sh
 
 LAST_SUCCESS=~/.claude/skills/credit-card-offers/state/last-success.json
 /usr/bin/python3 -c "
