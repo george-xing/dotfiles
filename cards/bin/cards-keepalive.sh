@@ -42,6 +42,7 @@ TELEGRAM_CHAT_ID=7953915703
 
 # cooldown_should_send LAST_ISO NOW_ISO WINDOW_SEC → "yes" | "no"
 # LAST_ISO may be empty string; returns "yes" if window elapsed (or never sent).
+# ISO timestamps may use either +00:00 or Z suffix (both UTC); both are accepted.
 cooldown_should_send() {
   local last="$1" now="$2" window="$3"
   if [[ -z "$last" ]]; then
@@ -52,8 +53,9 @@ cooldown_should_send() {
 import sys
 from datetime import datetime
 last_iso, now_iso, window_s = sys.argv[1], sys.argv[2], int(sys.argv[3])
-last = datetime.fromisoformat(last_iso)
-now = datetime.fromisoformat(now_iso)
+# Python 3.9's fromisoformat does not accept 'Z' suffix; normalize to +00:00.
+last = datetime.fromisoformat(last_iso.replace("Z", "+00:00"))
+now = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
 diff = (now - last).total_seconds()
 print("yes" if diff >= window_s else "no")
 PY
@@ -92,6 +94,8 @@ if [[ "${KEEPALIVE_SELFTEST:-0}" == "1" ]]; then
     "no" "$(cooldown_should_send '2026-05-14T06:00:01+00:00' '2026-05-14T12:00:00+00:00' 21600)"
   assert_eq "cooldown: exactly 6h+1s ago" \
     "yes" "$(cooldown_should_send '2026-05-14T05:59:59+00:00' '2026-05-14T12:00:00+00:00' 21600)"
+  assert_eq "cooldown: exactly 6h (Z suffix, boundary inclusive)" \
+    "yes" "$(cooldown_should_send '2026-05-14T06:00:00Z' '2026-05-14T12:00:00+00:00' 21600)"
 
   # Pure-function selftests will be added in subsequent tasks.
   # See: cooldown_should_send (Task 2), state_diff_is_notifiable (Task 3),
