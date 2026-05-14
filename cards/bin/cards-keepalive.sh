@@ -300,7 +300,8 @@ cooldown_get() {
 import json, sys
 path, key = sys.argv[1], sys.argv[2]
 try:
-    d = json.load(open(path))
+    with open(path) as f:
+        d = json.load(f)
 except (FileNotFoundError, json.JSONDecodeError):
     d = {}
 v = d.get(key)
@@ -315,7 +316,8 @@ cooldown_set() {
 import json, os, sys
 path, key, ts = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
-    d = json.load(open(path))
+    with open(path) as f:
+        d = json.load(f)
 except (FileNotFoundError, json.JSONDecodeError):
     d = {}
 d[key] = ts
