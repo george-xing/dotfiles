@@ -103,3 +103,94 @@ State (gitignored, on disk only):
 - `~/.claude/skills/credit-card-offers/state/pending.json` — pre-Telegram-send forensic crumb
 - `~/.claude/skills/credit-card-offers/state/{chase,amex}-activated.json` — dedup files, kept forever as audit log
 - `~/.claude/skills/credit-card-offers/state/screenshots/` — failure-time PNGs (last 14d)
+
+## Session-died recovery (keepalive Telegram path)
+
+When you receive a Telegram from `cards-keepalive` saying "State: authed → auth-wall" (or "→ tab-missing", "→ daemon-down"), the bot Chrome's session for that issuer has died and the next 03:00 fire will hit a login wall. Recovery:
+
+### auth-wall
+
+1. VNC into the Mac mini.
+2. Open the cards-bot Chrome window (port 19223; if you have multiple Chromes running, the cards one is the one with the Amex/Chase tabs).
+3. Sign back in on the affected issuer (or both). Complete any MFA challenge presented.
+4. **Do nothing else.** Don't navigate, don't close tabs, don't open new ones.
+5. The next keepalive iteration (within 5 minutes) will probe and record a `auth-wall → authed` event in `keepalive-events.jsonl`. **No code action needed.** The next 03:00 fire will succeed.
+
+### tab-missing
+
+Same recovery as auth-wall, plus: open a new tab to the issuer's offers URL:
+- Amex: `https://global.americanexpress.com/offers/eligible`
+- Chase: `https://secure.chase.com/web/auth/dashboard#/dashboard/offers/offerHub`
+
+### daemon-down
+
+The cards-bot Chrome itself is unreachable. Steps:
+
+```bash
+launchctl print gui/$(id -u)/com.pattybot.cards-bot-chrome
+# Look for last_exit_status, runs, state
+```
+
+If the daemon Chrome crashed, `KeepAlive=true` should respawn it. If respawn loop is broken:
+
+```bash
+launchctl bootout   gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.cards-bot-chrome.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.cards-bot-chrome.plist
+```
+
+Then sign in on both issuers (the persistent profile means cookies survive, but a fresh Chrome respawn may need to re-establish session in some cases).
+
+## Keepalive event-log forensics
+
+Useful one-liners for triaging keepalive state:
+
+```bash
+# Most-recent state per issuer
+tail -50 ~/.claude/skills/credit-card-offers/state/keepalive-events.jsonl | \
+  python3 -c "
+import sys, json
+last = {}
+for line in sys.stdin:
+    e = json.loads(line)
+    last[e['issuer']] = e
+for k, e in last.items():
+    print(f\"{k}: {e['new']} (since {e['ts']}, note: {e.get('note', '')})\")
+"
+
+# All auth-wall events in the last day
+grep auth-wall ~/.claude/skills/credit-card-offers/state/keepalive-events.jsonl | \
+  python3 -c "
+import sys, json
+from datetime import datetime, timezone, timedelta
+cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+for line in sys.stdin:
+    e = json.loads(line)
+    if datetime.fromisoformat(e['ts']) >= cutoff:
+        print(line.strip())
+"
+
+# Median session lifetime (auth-wall - prior authed timestamp)
+# Useful for tracking against the spec's 7-day soak metric.
+python3 <<'PY'
+import json
+from datetime import datetime
+events = []
+with open(__import__('os').path.expanduser('~/.claude/skills/credit-card-offers/state/keepalive-events.jsonl')) as f:
+    for line in f:
+        events.append(json.loads(line))
+durations = {}
+for issuer in ("amex", "chase"):
+    issuer_events = [e for e in events if e['issuer'] == issuer]
+    spans = []
+    last_authed = None
+    for e in issuer_events:
+        if e['new'] == 'authed':
+            last_authed = datetime.fromisoformat(e['ts'])
+        elif e['new'] == 'auth-wall' and last_authed:
+            spans.append((datetime.fromisoformat(e['ts']) - last_authed).total_seconds())
+            last_authed = None
+    if spans:
+        spans.sort()
+        print(f"{issuer}: n={len(spans)}, median={spans[len(spans)//2]/3600:.1f}h, p95={spans[int(len(spans)*0.95)]/3600:.1f}h")
+PY
+```

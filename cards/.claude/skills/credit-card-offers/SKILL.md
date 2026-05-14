@@ -24,6 +24,7 @@ The fire is daily-not-bidaily and at 03:00 PT specifically because banks pattern
 - **Does not type into ANY input field, ever.** No search boxes, no card-rename fields, no credential fields. Typing on banking sites is a behavioral signature.
 - **Does not click anything except the activate-offer buttons.** No "Got it" modals, no "Continue" prompts, no card switchers beyond the documented Amex card-switching pattern. The mid-run action set is the strictest in any skill in this repo.
 - **Does not retry clicks.** If an activate button doesn't transition to "Added" after one click + wait, record the failure and move on. Banks count failed activations as a fraud signal.
+- **Does not run the session keepalive inline.** Session-keepalive is a separate launchd job (`com.pattybot.cards-keepalive`, every 5 min) that maintains the bot Chrome's Amex/Chase session liveness between fires via `Page.bringToFront` + small scroll. The fire's only interaction with the keepalive is via `state/fire-in-progress.lock` (written at fire start, removed on exit) — the keepalive honors that lock and skips iterations during fires. Don't invoke `bin/cards-keepalive.sh` from this skill. See `docs/superpowers/specs/2026-05-13-cards-session-keepalive-design.md`.
 
 ## Workflow
 
@@ -326,3 +327,4 @@ In hard-fail cases (visibility / auth / mfa / challenge / dom / both_failed), do
 - **Do not advance state on Telegram failure.** A failed send must NOT update `last-success.json`.
 - **Do not send a Telegram error message when Telegram itself is the failure.** Log locally and exit.
 - **Do not send a Telegram message on `both_failed`.** No positive content to report; operator finds it in the log.
+- **Do not write to `state/keepalive-events.jsonl`, `state/auth-notify-cooldown.json`, or `state/fire-in-progress.lock`.** Those are owned by `cards-keepalive.sh` and `cards-fire.sh`'s wrapper layer respectively. The skill's writes go to `state/last-success.json`, `state/last-failure.json`, `state/pending.json`, and the dedup files only. Strict file ownership is part of the keepalive's defensive design.
