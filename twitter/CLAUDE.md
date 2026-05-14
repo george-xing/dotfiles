@@ -98,7 +98,7 @@ Operational failures here have a small, well-categorized set of root causes (`vi
 1. Read `~/.claude/skills/twitter-digest/state/last-failure.json` and the screenshot it points at.
 2. Match `kind` against the runbook table — most cases need an operator action (re-foreground the window, re-sign-in, update a selector), not a code change.
 3. **Avoid these "fixes" — they were considered and rejected, with reasoning in SKILL.md:**
-   - Faking foreground via CDP `Page.setWebLifecycleState("active")` or `Page.bringToFront`.
+   - Faking foreground via CDP `Page.setWebLifecycleState("active")` (mutates page lifecycle only; OS leaves the window backgrounded → page-state and OS-state disagree, which is itself a detectable mismatch). Note: `Page.bringToFront` is **not** rejected — it is the skill's first recovery step on `vis !== "visible"` because it routes through Chromium's `WebContentsImpl::Activate()` → `[NSWindow makeKeyAndOrderFront:]`, the same OS activation path a real user click takes; page and OS state stay in sync. See SKILL.md §"Failure semantics" for the full distinction.
    - Auto-clicking dismiss-y modal buttons by selector ("Got it", "Continue", "Skip", "Accept").
    - Programmatic X login.
    - Calling `browser-use close --all` anywhere in the flow.
