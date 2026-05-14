@@ -82,7 +82,8 @@ SCREENSHOT_DIR="$STATE_DIR/screenshots"
 LOG_FILE="$HOME/Library/Logs/cards-keepalive.log"
 
 JITTER_MAX_SEC=60
-STALE_LOCK_SEC=1800       # 30 min
+STALE_LOCK_SEC=3600       # 60 min — tertiary fallback against PID reuse;
+                          # primary lock-coordination is PID-alive check.
 COOLDOWN_SEC=21600        # 6 h
 CDP_TIMEOUT_SEC=5
 
@@ -358,14 +359,15 @@ In `cards/bin/cards-keepalive.sh`, append to the selftest block:
 
 ```bash
   # lock_is_stale(now_epoch, lock_mtime_epoch, stale_sec) → "yes" or "no"
+  # (Tested at the 60-min boundary that matches STALE_LOCK_SEC in production.)
   assert_eq "lock: 0s old" \
-    "no" "$(lock_is_stale 1700000000 1700000000 1800)"
-  assert_eq "lock: 29:59 old (just under cap)" \
-    "no" "$(lock_is_stale 1700001799 1700000000 1800)"
-  assert_eq "lock: 30:01 old (just over cap)" \
-    "yes" "$(lock_is_stale 1700001801 1700000000 1800)"
+    "no" "$(lock_is_stale 1700000000 1700000000 3600)"
+  assert_eq "lock: 59:59 old (just under cap)" \
+    "no" "$(lock_is_stale 1700003599 1700000000 3600)"
+  assert_eq "lock: 60:01 old (just over cap)" \
+    "yes" "$(lock_is_stale 1700003601 1700000000 3600)"
   assert_eq "lock: 7d old" \
-    "yes" "$(lock_is_stale 1700604800 1700000000 1800)"
+    "yes" "$(lock_is_stale 1700604800 1700000000 3600)"
 ```
 
 - [ ] **Step 2: Run selftest — verify failure**
@@ -432,16 +434,22 @@ In `cards/bin/cards-keepalive.sh`, add after the "Pure helpers" block (and above
 # ----------------------------------------------------------------------------
 
 # discover_tabs → prints "<issuer>|<ws_url>|<page_url>" lines, one per issuer.
-# ws_url is empty if no matching tab is found. Daemon-unreachable returns
-# exit 2 with no output.
+# ws_url is empty if no matching tab is found OR if the tab has no
+# webSocketDebuggerUrl (rare; service-worker-adjacent tabs). Daemon-unreachable
+# returns exit 2 (curl failure). Malformed JSON from Chrome returns exit 3
+# (treated by main flow as a dom-error event, NOT daemon-down).
 discover_tabs() {
-  local json
-  if ! json=$(curl --max-time "$CDP_TIMEOUT_SEC" -fsS "http://127.0.0.1:$DAEMON_PORT/json" 2>/dev/null); then
+  local raw
+  if ! raw=$(curl --max-time "$CDP_TIMEOUT_SEC" -fsS "http://127.0.0.1:$DAEMON_PORT/json" 2>/dev/null); then
     return 2
   fi
-  "$PYTHON_BIN" - "$json" <<'PY'
+  "$PYTHON_BIN" - "$raw" <<'PY'
 import json, sys
-tabs = json.loads(sys.argv[1])
+try:
+    tabs = json.loads(sys.argv[1])
+except json.JSONDecodeError as e:
+    print(f"discover_tabs: malformed CDP /json: {e}", file=sys.stderr)
+    sys.exit(3)
 tracked = [
     ("amex",  "americanexpress.com"),
     ("chase", "chase.com"),
@@ -449,8 +457,10 @@ tracked = [
 page_tabs = [t for t in tabs if t.get("type") == "page"]
 for issuer, needle in tracked:
     match = next((t for t in page_tabs if needle in (t.get("url") or "")), None)
-    ws_url = match["webSocketDebuggerUrl"] if match else ""
-    page_url = match.get("url") if match else ""
+    # Defensive: a matched tab without webSocketDebuggerUrl is unusable.
+    # Treat as if no tab was found (will emit tab-missing in main flow).
+    ws_url = (match.get("webSocketDebuggerUrl") or "") if match else ""
+    page_url = (match.get("url") or "") if match else ""
     print(f"{issuer}|{ws_url}|{page_url}")
 PY
 }
@@ -648,22 +658,32 @@ Expected JSON line like:
 ```
 or with `hasPwInput: true` if logged out.
 
-- [ ] **Step 3: Smoke-test `probe_tab_to_state`**
+- [ ] **Step 3: Add selftest assertions for `probe_tab_to_state` (it's pure)**
+
+In `cards/bin/cards-keepalive.sh`, append to the selftest block (after the lock-age assertions):
+
+```bash
+  # probe_tab_to_state(probe_json) → state
+  # Precedence: err > hasPwInput > vis-error > authed.
+  assert_eq "probe: authed" \
+    "authed" "$(probe_tab_to_state '{"vis":"visible","hasPwInput":false,"url":"x","err":""}')"
+  assert_eq "probe: auth-wall (pw input)" \
+    "auth-wall" "$(probe_tab_to_state '{"vis":"visible","hasPwInput":true,"url":"x","err":""}')"
+  assert_eq "probe: vis-error (hidden)" \
+    "vis-error" "$(probe_tab_to_state '{"vis":"hidden","hasPwInput":false,"url":"x","err":""}')"
+  assert_eq "probe: dom-error (ws failed)" \
+    "dom-error" "$(probe_tab_to_state '{"err":"ws connect: refused"}')"
+  assert_eq "probe: err wins over hasPwInput" \
+    "dom-error" "$(probe_tab_to_state '{"vis":"visible","hasPwInput":true,"url":"x","err":"eval failed"}')"
+  assert_eq "probe: pw input wins over vis-error" \
+    "auth-wall" "$(probe_tab_to_state '{"vis":"hidden","hasPwInput":true,"url":"x","err":""}')"
+```
 
 Run:
 ```bash
-( source cards/bin/cards-keepalive.sh 2>/dev/null; \
-  probe_tab_to_state '{"vis":"visible","hasPwInput":false,"url":"x","err":""}' )
-# Expected: authed
-
-( source cards/bin/cards-keepalive.sh 2>/dev/null; \
-  probe_tab_to_state '{"vis":"visible","hasPwInput":true,"url":"x","err":""}' )
-# Expected: auth-wall
-
-( source cards/bin/cards-keepalive.sh 2>/dev/null; \
-  probe_tab_to_state '{"err":"ws connect: refused"}' )
-# Expected: dom-error
+KEEPALIVE_SELFTEST=1 cards/bin/cards-keepalive.sh
 ```
+Expected: 6 new `ok` lines (25/25 passed total after Tasks 2+3+4+6).
 
 - [ ] **Step 4: Commit**
 
@@ -878,7 +898,7 @@ capture_screenshot() {
   local ts; ts=$(date -u +%Y%m%dT%H%M%SZ)
   local path="$SCREENSHOT_DIR/keepalive-${label}-${issuer}-${ts}.png"
   if "$PYTHON_BIN" - "$ws_url" "$path" <<'PY' 2>/dev/null
-import json, sys, base64
+import json, os, sys, base64
 try:
     import websocket
 except ImportError:
@@ -897,6 +917,10 @@ try:
         sys.exit(1)
     with open(out, "wb") as f:
         f.write(base64.b64decode(b64))
+    # Defensive: reject 0-byte files (decode succeeded with empty data).
+    if os.path.getsize(out) == 0:
+        os.unlink(out)
+        sys.exit(1)
 except Exception:
     sys.exit(1)
 PY
@@ -1052,21 +1076,40 @@ mkdir -p "$STATE_DIR" || {
 # 1. Jitter sleep (breaks perfect-cadence pattern).
 sleep $((RANDOM % (JITTER_MAX_SEC + 1)))
 
-# 2. Lock check.
+# 2. Lock check — PID-alive first, mtime cap as tertiary fallback (vs PID reuse).
 if [[ -f "$LOCK_FILE" ]]; then
   now_epoch=$(date +%s)
   lock_mtime=$(stat -f %m "$LOCK_FILE" 2>/dev/null || echo 0)
-  if [[ "$(lock_is_stale "$now_epoch" "$lock_mtime" "$STALE_LOCK_SEC")" == "no" ]]; then
-    # Active fire in progress — defer.
-    exit 0
+  lock_pid=$(awk '{print $1}' "$LOCK_FILE" 2>/dev/null)
+
+  if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+    # Lock holder PID is alive. Defer unless lock is older than 60-min cap
+    # (which would suggest a coincidental PID reuse of a long-dead fire).
+    if [[ "$(lock_is_stale "$now_epoch" "$lock_mtime" "$STALE_LOCK_SEC")" == "no" ]]; then
+      # Active fire in progress — defer silently.
+      exit 0
+    fi
+    # PID matches but lock is suspiciously old → likely PID reuse; proceed
+    # with a warning logged so an operator can investigate.
+    printf "%s stale-lock proceed (pid=%s alive but lock-age>%s, PID reuse?)\n" \
+      "$(date -u +%FT%TZ)" "$lock_pid" "$STALE_LOCK_SEC" >> "$LOG_FILE"
+  else
+    # Lock-holder PID is dead, missing, or unparseable. Proceed.
+    if [[ "$(lock_is_stale "$now_epoch" "$lock_mtime" "$STALE_LOCK_SEC")" == "no" ]]; then
+      # Lock is recent but PID is dead — fire crashed without firing its trap.
+      printf "%s orphan-lock proceed (pid=%s dead, mtime=%s)\n" \
+        "$(date -u +%FT%TZ)" "${lock_pid:-?}" "$lock_mtime" >> "$LOG_FILE"
+    else
+      printf "%s stale-lock proceed (pid=%s dead, lock-age>%s)\n" \
+        "$(date -u +%FT%TZ)" "${lock_pid:-?}" "$STALE_LOCK_SEC" >> "$LOG_FILE"
+    fi
   fi
-  # Stale; log and proceed.
-  printf "%s stale-lock proceed (lock mtime=%s now=%s)\n" \
-    "$(date -u +%FT%TZ)" "$lock_mtime" "$now_epoch" >> "$LOG_FILE"
 fi
 
 # 3. Discover tabs.
-if ! tabs_out=$(discover_tabs); then
+discover_rc=0
+tabs_out=$(discover_tabs) || discover_rc=$?
+if [[ $discover_rc -eq 2 ]]; then
   # Daemon unreachable.
   now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
   prev_daemon=$(last_state_for both)
@@ -1085,6 +1128,24 @@ if ! tabs_out=$(discover_tabs); then
     fi
   fi
   exit 2
+fi
+if [[ $discover_rc -eq 3 ]]; then
+  # Malformed JSON from CDP /json — chrome is responding but broken.
+  # Record as dom-error (silent per OD8) for both issuers, exit 0.
+  now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  for issuer in amex chase; do
+    prev=$(last_state_for "$issuer")
+    if [[ "$prev" != "dom-error" ]]; then
+      append_event "$issuer" "$prev" dom-error "discover_tabs: malformed /json"
+      printf "%s %s %s→dom-error silent\n" "$now_iso" "$issuer" "$prev" >> "$LOG_FILE"
+    fi
+  done
+  exit 0
+fi
+if [[ $discover_rc -ne 0 ]]; then
+  printf "%s discover_tabs unexpected rc=%d\n" \
+    "$(date -u +%FT%TZ)" "$discover_rc" >> "$LOG_FILE"
+  exit "$discover_rc"
 fi
 
 # 4. Per-tab work.
@@ -1211,22 +1272,46 @@ Identify three insertion points:
 2. The exit/cleanup path (existing `trap` or just before `exit`).
 3. After the fire body completes (before exit), where we'll park tabs.
 
-- [ ] **Step 2: Add the lock-write block**
+- [ ] **Step 2: Locate the existing shlock-cleanup trap (line 104 as of HEAD)**
 
-In `cards/bin/cards-fire.sh`, immediately after the line that ACQUIRES the flock (the line that runs `flock` or `shlock` for the `.cards-fire.lock` file), insert:
+Run:
+```bash
+grep -n 'trap.*LOCK_FILE' cards/bin/cards-fire.sh
+```
+Expected output (or similar):
+```
+104:trap 'rm -f "$LOCK_FILE"' EXIT INT TERM
+```
+
+This existing trap cleans the shlock at `~/.claude/skills/.cards-fire.lock`. The new keepalive lock lives at `state/fire-in-progress.lock` — a different file. **We must combine them**, not stack two traps, because the second `trap` call replaces the first (bash does not append by default).
+
+- [ ] **Step 3: Add the lock-write block + combined trap**
+
+In `cards/bin/cards-fire.sh`, find the existing block ending in `trap 'rm -f "$LOCK_FILE"' EXIT INT TERM` (around line 104). Replace those nearby lines with the following — declare both locks together and combine the trap into a single rm-f:
 
 ```bash
+# Acquire lock via shlock(1) — macOS-native PID-file locking with built-in
+# stale-PID detection. shlock writes the holder PID to LOCK_FILE atomically.
+# If lock file exists but holder is dead, shlock cleans it and acquires.
+if ! "$SHLOCK_BIN" -p $$ -f "$LOCK_FILE"; then
+  HOLDER_PID=$(cat "$LOCK_FILE" 2>/dev/null || echo "?")
+  echo "fire: another fire is in progress (lock holder PID $HOLDER_PID) — exiting kind:busy" >&2
+  exit 3
+fi
+
 # fire-in-progress sentinel: tells cards-keepalive.sh to skip iterations
-# while we own the bot Chrome. Cleaned up by the trap below.
+# while we own the bot Chrome. PID-aware (first whitespace-delimited token).
 FIRE_IN_PROGRESS_LOCK="$HOME/.claude/skills/credit-card-offers/state/fire-in-progress.lock"
 mkdir -p "$(dirname "$FIRE_IN_PROGRESS_LOCK")"
 echo "$$ $(date -u +%FT%TZ)" > "$FIRE_IN_PROGRESS_LOCK"
-trap 'rm -f "$FIRE_IN_PROGRESS_LOCK"' EXIT INT TERM
+
+# Single combined trap — cleans BOTH locks on any exit path.
+trap 'rm -f "$LOCK_FILE" "$FIRE_IN_PROGRESS_LOCK"' EXIT INT TERM
 ```
 
-If `cards-fire.sh` already has a `trap` registered, **append** the `rm -f` to it rather than overwriting. (Multiple traps for the same signal stomp on each other in bash.) If unsure, read the existing trap and combine.
+The crucial constraint: only ONE `trap ... EXIT INT TERM` invocation, listing both files.
 
-- [ ] **Step 3: Add the park-on-offers block (just before script exit)**
+- [ ] **Step 4: Add the park-on-offers block (just before script exit)**
 
 Identify the last statement before the script exits successfully (after the `claude -p` invocation and any post-claude cleanup). Insert this block immediately before the exit:
 
@@ -1315,7 +1400,7 @@ PY
 park_offers_tabs || true
 ```
 
-- [ ] **Step 4: Syntax check**
+- [ ] **Step 5: Syntax check**
 
 Run:
 ```bash
@@ -1323,7 +1408,7 @@ bash -n cards/bin/cards-fire.sh
 ```
 Expected: silent exit 0.
 
-- [ ] **Step 5: Smoke-test the lock + trap**
+- [ ] **Step 6: Smoke-test the lock + trap**
 
 Run:
 ```bash
@@ -1340,7 +1425,7 @@ ls "$HOME/.claude/skills/credit-card-offers/state/fire-in-progress.lock" 2>&1
 # Expected: "No such file or directory" — trap cleaned up.
 ```
 
-- [ ] **Step 6: Smoke-test park-on-offers**
+- [ ] **Step 7: Smoke-test park-on-offers**
 
 Manually open the bot Chrome's Amex tab on some non-offers URL (e.g. amex.com home). Run:
 
@@ -1356,7 +1441,7 @@ for t in json.load(sys.stdin):
 ```
 Expected: URL ends with `/offers/eligible`.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add cards/bin/cards-fire.sh
@@ -1682,141 +1767,80 @@ Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>"
 
 ---
 
-## Task 14: Merge worktree branch to main, stow-refresh, launchctl bootstrap
+## Task 14: Run validation Rungs 1–5 IN THE WORKTREE (pre-merge gate)
 
 **Files:**
-- (No file changes in this task — merge + stow + launchctl.)
+- (No file changes — validation only. Spec DoD §13 step 1 explicitly requires Rungs 1–5 pass before merge.)
 
-This task transfers the implementation from the worktree branch to your live working copy and activates the keepalive.
+Run against the worktree's `cards/bin/cards-keepalive.sh` directly (absolute path), without stow or launchctl involvement. This gates the merge: if any rung fails, fix in the worktree before proceeding to Task 15.
 
-- [ ] **Step 1: Verify the worktree branch is clean and tests pass**
+- [ ] **Step 1: Verify worktree is clean and selftest passes**
 
 Run from inside the worktree:
 ```bash
 git status              # expect "nothing to commit, working tree clean"
-git log --oneline -15   # confirm the planned commits are all here
+git log --oneline -15   # confirm planned commits are present
 
-# Last selftest pass
 KEEPALIVE_SELFTEST=1 cards/bin/cards-keepalive.sh
-# Expected: 19/19 passed
+# Expected: 25/25 passed (cooldown 6, state-diff 9, lock-age 4, probe 6)
 ```
 
-- [ ] **Step 2: Exit the worktree (keep, don't remove — we want the branch on disk for merge)**
-
-Run:
-```bash
-# This step is performed by the orchestrator (Claude), not the engineer:
-# ExitWorktree(action="keep")
-```
-
-The session returns to `/Users/pattybot/dotfiles`. The branch `worktree-cards-keepalive-spec-v2` remains.
-
-- [ ] **Step 3: Merge to main (or whatever the active branch is)**
-
-Run from `~/dotfiles`:
-```bash
-cd ~/dotfiles
-git branch -v             # check current branch (likely main or similar)
-git merge --no-ff worktree-cards-keepalive-spec-v2 -m "Merge cards-keepalive design + implementation"
-git log --oneline -5
-```
-
-If the merge has conflicts (unlikely — the files are mostly new), resolve them by preferring the worktree branch's versions for new files and merging the modifications manually.
-
-- [ ] **Step 4: Run stow to refresh symlinks**
+- [ ] **Step 2: Rung 1 — Static checks**
 
 ```bash
-cd ~/dotfiles && stow -t ~ -R cards
-ls -la ~/bin/cards-keepalive.sh
-ls -la ~/Library/LaunchAgents/com.pattybot.cards-keepalive.plist
-```
-Expected: both are symlinks resolving into `~/dotfiles/cards/bin/cards-keepalive.sh` and `~/dotfiles/cards/Library/LaunchAgents/com.pattybot.cards-keepalive.plist`.
-
-- [ ] **Step 5: Bootstrap the launchd job**
-
-```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.cards-keepalive.plist
-launchctl print gui/$(id -u)/com.pattybot.cards-keepalive
-```
-Expected: `state = running` or `state = waiting` (job idle until next StartInterval), `last_exit_status = 0`.
-
-Because `RunAtLoad=true`, the first iteration kicks off immediately:
-
-```bash
-sleep 90   # wait past the jitter + first iteration
-ls -la "$HOME/.claude/skills/credit-card-offers/state/keepalive-events.jsonl"
-tail -20  "$HOME/.claude/skills/credit-card-offers/state/keepalive-events.jsonl"
-```
-Expected: at least one event per issuer (transitions from `unknown` to whatever the current state is).
-
-- [ ] **Step 6: Delete the now-merged worktree branch (optional)**
-
-```bash
-cd ~/dotfiles
-git worktree remove .claude/worktrees/cards-keepalive-spec-v2 --force
-git branch -d worktree-cards-keepalive-spec-v2
-```
-
-- [ ] **Step 7: Commit (none) — this task only changes infrastructure state.**
-
-No git changes in this task; the merge commit was the actual git work. The bootstrap is persistent across reboots because the plist is in `~/Library/LaunchAgents/`.
-
----
-
-## Task 15: Run validation Rungs 1–6 from the spec
-
-**Files:**
-- (No file changes — validation only.)
-
-Per `docs/superpowers/specs/2026-05-13-cards-session-keepalive-design.md` §8, run the validation ladder against the live deployment.
-
-- [ ] **Step 1: Rung 1 — Static checks**
-
-```bash
-bash -n ~/dotfiles/cards/bin/cards-keepalive.sh && echo "syntax ok"
-plutil -lint ~/dotfiles/cards/Library/LaunchAgents/com.pattybot.cards-keepalive.plist
+bash -n cards/bin/cards-keepalive.sh && echo "syntax ok"
+plutil -lint cards/Library/LaunchAgents/com.pattybot.cards-keepalive.plist
 test -x /usr/bin/python3 && echo "python3 ok"
 /usr/bin/python3 -c "import websocket" && echo "websocket-client ok"
 test -x /Users/pattybot/dotfiles/twitter/bin/lib/telegram-send.sh && echo "tg helper ok"
-shellcheck ~/dotfiles/cards/bin/cards-keepalive.sh 2>&1 | head -30 || echo "(shellcheck not installed; skip)"
+shellcheck cards/bin/cards-keepalive.sh 2>&1 | head -30 || echo "(shellcheck not installed; skip)"
 ```
 Expected: all checks ok.
 
-- [ ] **Step 2: Rung 2 — about:blank smoke (no banks)**
+- [ ] **Step 3: Rung 2 — about:blank smoke (no banks)**
 
 Open a non-bank tab in the bot Chrome (any URL that doesn't match `americanexpress.com` or `chase.com`). Run:
 
 ```bash
-~/dotfiles/cards/bin/cards-keepalive.sh
+cards/bin/cards-keepalive.sh
 echo "exit: $?"
 tail -5 ~/.claude/skills/credit-card-offers/state/keepalive-events.jsonl
 ```
 
 Expected: tab-missing events for both issuers if no matching tab is open. Telegram sent on first observation (per OD8).
 
-- [ ] **Step 3: Rung 3 — Selftest**
+- [ ] **Step 4: Rung 3 — Self-test mode**
 
 ```bash
-KEEPALIVE_SELFTEST=1 ~/dotfiles/cards/bin/cards-keepalive.sh
+KEEPALIVE_SELFTEST=1 cards/bin/cards-keepalive.sh
 ```
-Expected: 19/19 passed.
+Expected: 25/25 passed.
 
-- [ ] **Step 4: Rung 4 — Coexistence test**
+- [ ] **Step 5: Rung 4 — Coexistence test (PID-aware)**
 
 ```bash
-echo "99999 $(date -u +%FT%TZ)" > ~/.claude/skills/credit-card-offers/state/fire-in-progress.lock
-~/dotfiles/cards/bin/cards-keepalive.sh
-echo "fresh-lock exit: $?  (expected 0, silent skip)"
+# Fresh, alive PID — must defer.
+LOCK=~/.claude/skills/credit-card-offers/state/fire-in-progress.lock
+echo "$$ $(date -u +%FT%TZ)" > "$LOCK"
+cards/bin/cards-keepalive.sh
+echo "alive-PID exit: $?  (expected 0, silent skip)"
 
-touch -t $(date -v-35M +%Y%m%d%H%M) ~/.claude/skills/credit-card-offers/state/fire-in-progress.lock
-~/dotfiles/cards/bin/cards-keepalive.sh
-echo "stale-lock exit: $? (expected 0 or 2, proceeds normally)"
+# Same lock but mtime > 60 min — stale fallback kicks in even with alive PID.
+touch -t $(date -v-65M +%Y%m%d%H%M) "$LOCK"
+cards/bin/cards-keepalive.sh
+echo "alive-PID + stale-mtime exit: $? (expected 0 or 2, proceeds with PID-reuse log)"
+grep -F "PID reuse?" ~/Library/Logs/cards-keepalive.log | tail -1
 
-rm -f ~/.claude/skills/credit-card-offers/state/fire-in-progress.lock
+# Dead PID — proceed regardless of mtime.
+echo "999999 $(date -u +%FT%TZ)" > "$LOCK"
+cards/bin/cards-keepalive.sh
+echo "dead-PID exit: $? (expected 0 or 2, proceeds with orphan-lock log)"
+grep -F "orphan-lock proceed" ~/Library/Logs/cards-keepalive.log | tail -1
+
+rm -f "$LOCK"
 ```
-Expected behavior matches the comments.
 
-- [ ] **Step 5: Rung 5 — Failure injection (one kind at a time)**
+- [ ] **Step 6: Rung 5 — Failure injection (one kind at a time)**
 
 For each kind, induce → run keepalive → check expected outcome.
 
@@ -1824,33 +1848,31 @@ For each kind, induce → run keepalive → check expected outcome.
 # kind: daemon-down
 launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.cards-bot-chrome.plist
 sleep 3
-~/dotfiles/cards/bin/cards-keepalive.sh
+cards/bin/cards-keepalive.sh
 echo "exit: $?  (expected 2)"
 tail -2 ~/.claude/skills/credit-card-offers/state/keepalive-events.jsonl
 # Expected: daemon-down event, Telegram fired (first time)
 
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.cards-bot-chrome.plist
 sleep 10
-# Now restore and run again; expect daemon-down → authed/auth-wall transition
-~/dotfiles/cards/bin/cards-keepalive.sh
+cards/bin/cards-keepalive.sh
+# Expected: recovery to authed or auth-wall depending on session state
 
 # kind: tab-missing
 # Manually close the Amex tab in the bot Chrome via VNC, then:
-~/dotfiles/cards/bin/cards-keepalive.sh
+cards/bin/cards-keepalive.sh
 tail -2 ~/.claude/skills/credit-card-offers/state/keepalive-events.jsonl
 # Expected: amex tab-missing event, chase unaffected
 
 # kind: auth-wall
-# Manually navigate the Amex tab to https://www.americanexpress.com/en-us/account/login/
-# (signs out), then:
-~/dotfiles/cards/bin/cards-keepalive.sh
+# Manually navigate Amex tab to https://www.americanexpress.com/en-us/account/login/
+cards/bin/cards-keepalive.sh
 # Expected: amex auth-wall event, Telegram (subject to cooldown from prior tests)
 
 # kind: dom-error
 # In the bot Chrome DevTools console on the Amex tab, run:
 #   delete window.scrollBy
-# Then:
-~/dotfiles/cards/bin/cards-keepalive.sh
+cards/bin/cards-keepalive.sh
 tail -2 ~/.claude/skills/credit-card-offers/state/keepalive-events.jsonl
 # Expected: amex dom-error event, NO Telegram (this kind is silent)
 
@@ -1858,29 +1880,91 @@ tail -2 ~/.claude/skills/credit-card-offers/state/keepalive-events.jsonl
 
 # kind: config
 chmod 000 ~/.claude/skills/credit-card-offers/state
-~/dotfiles/cards/bin/cards-keepalive.sh
+cards/bin/cards-keepalive.sh
 echo "exit: $?  (expected 1, error on stderr)"
 chmod 755 ~/.claude/skills/credit-card-offers/state
 ```
 
-Verify each transition is documented in the spec's §7.1 taxonomy and Rung 5 expected-outcome table.
+Verify each transition matches spec §7.1 taxonomy and the Rung 5 expected-outcome table.
 
-- [ ] **Step 6: Rung 6 — Live bootstrap watch**
+- [ ] **Step 7: GATE — only proceed to Task 15 if Rungs 1–5 all green**
 
+If any rung failed, fix in the worktree (add tasks if necessary, re-run from Step 1) before merging.
+
+---
+
+## Task 15: Merge worktree → main, stow refresh, launchctl bootstrap, post-bootstrap Rung 6
+
+**Files:**
+- (No file changes — merge + stow + launchctl + Rung 6 validation.)
+
+Pre-condition: Task 14 Rungs 1–5 ALL green. Do not proceed otherwise.
+
+- [ ] **Step 1: Exit the worktree (keep — branch needs to remain on disk for merge)**
+
+Orchestrator action: `ExitWorktree(action="keep")`. The session returns to `/Users/pattybot/dotfiles`. Branch `worktree-cards-keepalive-spec-v2` remains.
+
+- [ ] **Step 2: Merge to main**
+
+Run from `~/dotfiles`:
 ```bash
-# Already bootstrapped in Task 14 — just verify
-launchctl print gui/$(id -u)/com.pattybot.cards-keepalive | grep -E '^\s*(state|last exit|runs)'
-tail -f ~/.claude/skills/credit-card-offers/state/keepalive-events.jsonl &
-TAIL_PID=$!
-sleep 1800   # watch for 30 min
-kill $TAIL_PID 2>/dev/null
+cd ~/dotfiles
+git branch -v
+git merge --no-ff worktree-cards-keepalive-spec-v2 \
+  -m "Merge cards-keepalive design + implementation (validation Rungs 1-5 passed)"
+git log --oneline -5
 ```
 
-Expected: silent for 30 min unless something genuinely transitioned. If a Telegram fires during this window against a known-good session, abort and debug.
+If conflicts arise (unlikely — new files dominate), prefer the worktree branch's versions for new files and merge modifications manually.
+
+- [ ] **Step 3: Run stow to refresh symlinks**
+
+```bash
+cd ~/dotfiles && stow -t ~ -R cards
+ls -la ~/bin/cards-keepalive.sh
+ls -la ~/Library/LaunchAgents/com.pattybot.cards-keepalive.plist
+```
+Expected: both symlinks resolve into `~/dotfiles/cards/...`.
+
+- [ ] **Step 4: Bootstrap the launchd job**
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.cards-keepalive.plist
+launchctl print gui/$(id -u)/com.pattybot.cards-keepalive | grep -E '^\s*(state|last exit|runs)'
+```
+Expected: `state = running` or `state = waiting`, `last exit status = 0`.
+
+Because `RunAtLoad=true`, the first iteration kicks off immediately:
+
+```bash
+sleep 90   # past jitter + first iteration
+ls -la ~/.claude/skills/credit-card-offers/state/keepalive-events.jsonl
+tail -5  ~/.claude/skills/credit-card-offers/state/keepalive-events.jsonl
+```
+
+Expected: one event per issuer (transitions from current state — which after Task 14 testing may already be recorded — to whatever's current).
+
+- [ ] **Step 5: Rung 6 — Live bootstrap watch**
+
+```bash
+tail -f ~/.claude/skills/credit-card-offers/state/keepalive-events.jsonl &
+TAIL_PID=$!
+sleep 1800   # 30 min
+kill $TAIL_PID 2>/dev/null
+```
+Expected: no new lines added unless a real state transition occurred. If a Telegram fires within this window against a known-good session, `launchctl bootout` the keepalive immediately and debug.
+
+- [ ] **Step 6: Delete the worktree (optional once green)**
+
+```bash
+cd ~/dotfiles
+git worktree remove .claude/worktrees/cards-keepalive-spec-v2 --force
+git branch -d worktree-cards-keepalive-spec-v2
+```
 
 - [ ] **Step 7: Document validation results**
 
-Append a note to the spec's `## 13. Definition of done` section (or a new `## 14. Validation results` section) recording: which rungs passed, any deviations from expected behavior, screenshots saved during failure injection. Commit with message `cards: record keepalive validation Rungs 1-6 results`.
+Append a `## 14. Validation results (YYYY-MM-DD)` section to the spec recording which rungs passed, deviations, screenshots saved. Commit `cards: record keepalive validation Rungs 1-6 results`.
 
 ---
 

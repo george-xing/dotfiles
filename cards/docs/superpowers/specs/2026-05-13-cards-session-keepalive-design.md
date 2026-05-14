@@ -65,7 +65,7 @@ These constraints apply to the keepalive script the same way they apply to the e
 
 - **Bot Chrome (KeepAlive=true)** is the shared resource. All three jobs read its CDP socket.
 - **`state/fire-in-progress.lock`** is the keepalive's "stay out of the way" signal. `cards-fire.sh` writes it at start and removes it on `trap EXIT INT TERM`.
-- **Lock is *advisory*, not OS-enforced.** Keepalive treats any lock with `mtime > 30 minutes` as stale and proceeds anyway — defense against fire crash-without-trap.
+- **Lock is *advisory*, not OS-enforced.** The lock file's first whitespace-delimited token is the fire's PID. Keepalive does a **PID-alive check first** (`kill -0 <pid>`): if the holder is alive AND the lock is younger than the 60-min stale cap, defer; otherwise proceed. If the holder PID is dead or unparseable, proceed regardless of lock age. The 60-min cap exists only as a defense against PID reuse (where a dead fire's PID happens to be reassigned to an unrelated process). This is more correct than mtime-only and accommodates legitimate long fires (the `credit-card-offers` skill has no built-in time cap).
 - **No exclusive lock on the CDP socket itself.** Multiple connections to `/json` and to webSocketDebuggerUrls are explicitly OK. The lock coordinates *behavior* (don't bringToFront during a fire), not socket access.
 
 ### 4.3 Why not co-locate keepalive logic inside `cards-fire.sh`
@@ -389,7 +389,7 @@ These are deliberately deferred to the implementation plan (writing-plans skill)
 | OD3 | Scroll amount | 1–3 px forward | hardcoded constant; could be env later |
 | OD4 | Counter-scroll amount | -2 px | hardcoded |
 | OD5 | Notify cooldown | 6 h per key | env override allowed |
-| OD6 | Stale-lock cap | 30 min | hardcoded constant |
+| OD6 | Lock coordination | PID-alive check via `kill -0` first; 60-min `mtime` cap as tertiary fallback against PID reuse | hardcoded constants |
 | OD7 | Probe timeout per CDP call | 5 s | hardcoded |
 | OD8 | First-observation notifiability | `unknown → auth-wall` notifies; `unknown → authed` does not; `unknown → tab-missing` notifies; `unknown → daemon-down` notifies | encoded in state-diff table |
 | OD9 | Health-check Telegram format | issuer name, transition, screenshot path, runbook hint | template stays in script |
@@ -421,9 +421,12 @@ These are deliberately deferred to the implementation plan (writing-plans skill)
 
 The build is "shipped" when:
 
-1. Rungs 1–6 all pass.
-2. Keepalive plist is bootstrapped via `launchctl bootstrap`.
-3. First 24 h of `keepalive-events.jsonl` shows expected event types only (no `config`, no `dom-error` storms, no off-cadence Telegrams).
-4. Documentation updates land in `CLAUDE.md`, `SKILL.md`, `runbook.md`.
+1. **Rungs 1–5 pass *in the worktree, before merge*** — pre-merge validation gates the merge. Pre-merge rungs execute against the worktree's script (absolute path) without requiring stow or launchctl bootstrap.
+2. Merge to main + `stow -t ~ -R cards` + `launchctl bootstrap` happen as a unit only after step 1 is green.
+3. **Rung 6** (live bootstrap watch — first 30 min must be silent against a known-good session) passes post-bootstrap.
+4. First 24 h of `keepalive-events.jsonl` shows expected event types only (no `config`, no `dom-error` storms, no off-cadence Telegrams).
+5. Documentation updates land in `CLAUDE.md`, `SKILL.md`, `runbook.md`.
+
+Validation-before-merge is intentional: pre-merge validation costs only worktree state; post-merge cleanup involves un-bootstrapping, reverting commits, and cookie hygiene. The cost asymmetry justifies the gate order.
 
 Soak success (the bar that determines whether Approach A is the *right* answer) is evaluated at the 7-day and 28-day marks against the metrics enumerated in Rung 7.
