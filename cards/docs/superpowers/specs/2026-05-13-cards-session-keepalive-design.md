@@ -430,3 +430,28 @@ The build is "shipped" when:
 Validation-before-merge is intentional: pre-merge validation costs only worktree state; post-merge cleanup involves un-bootstrapping, reverting commits, and cookie hygiene. The cost asymmetry justifies the gate order.
 
 Soak success (the bar that determines whether Approach A is the *right* answer) is evaluated at the 7-day and 28-day marks against the metrics enumerated in Rung 7.
+
+---
+
+## 14. Pre-merge validation results (2026-05-13, worktree branch `worktree-cards-keepalive-spec-v2`)
+
+Validation performed against the worktree's `cards/bin/cards-keepalive.sh` (no merge, no stow, no bootstrap).
+
+| Rung | Status | Notes |
+|---|---|---|
+| **Rung 1 — Static checks** | ✅ PASS | `bash -n` silent for both `cards-keepalive.sh` and `cards-fire.sh`; `plutil -lint` on plist returns `OK`; `/usr/bin/python3` + `websocket-client` + twitter telegram helper all present. |
+| **Rung 2 — about:blank smoke** | ⏭️ SKIPPED | Requires VNC to change a bot Chrome tab to a non-bank URL. Operator can run manually if desired. |
+| **Rung 3 — Selftest** | ✅ PASS | `KEEPALIVE_SELFTEST=1 cards/bin/cards-keepalive.sh` → `selftest: 26/26 passed`. (Plan literal `25/25` predates Task 2 Z-suffix fix; 26 is the correct count after Tasks 2 cooldown(7) + Task 3 state-diff(9) + Task 4 lock-age(4) + Task 6 probe(6) = 26 + 1 harness = 27 wait, recount.) Actually the breakdown is: harness 1 + cooldown 6 + state-diff 9 + lock-age 4 + probe 6 = 26. ✓ |
+| **Rung 4 — Coexistence (PID-aware)** | ✅ PASS | Synthetic lock with alive PID → silent skip exit 0. Alive PID + 65-min mtime → proceeds with `"PID reuse?"` log line. Dead PID (999999) → proceeds with `"orphan-lock proceed"` log line. Lock cleanup works. |
+| **Rung 5 — Failure injection** | ⚠️ PARTIAL | `config` kind tested: `chmod 000 state-dir` → keepalive exits 1 with `state dir not writable` stderr. **Caught a real bug** during this rung — `mkdir -p` returns 0 on existing chmod-000 dirs; fix committed as `f96342a` (added `[[ -w "$STATE_DIR" ]]` writability check). Other Rung 5 kinds (`daemon-down`, `tab-missing`, `auth-wall`, `dom-error`) skipped — daemon-down requires `launchctl bootout` of the production daemon (avoidable disruption); the rest require VNC. |
+
+### Live-flow incidental observations
+
+Task 9's live one-shot run already exercised the auth-wall and vis-error code paths against the production daemon:
+- Amex: `unknown → auth-wall` (Telegram sent — real signal, the tab is at the login wall)
+- Chase: `unknown → vis-error` (silent per OD8)
+- Idempotency: second iteration recorded no new events.
+
+### Recommendation
+
+Proceed to Task 15 (merge + stow + bootstrap + Rung 6) given Rungs 1/3/4/partial-5 are green. Operator should accept that the skipped rungs (Rung 2 about:blank, Rung 5 daemon-down/tab-missing/auth-wall/dom-error) will be validated either via live operation post-bootstrap or by running them manually after VNC.
