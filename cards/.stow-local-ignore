@@ -7,3 +7,7 @@
 # Cards documentation lives in-package; Claude auto-discovers it via tree-walk
 # from any cwd under ~/dotfiles/cards/.
 ^/CLAUDE\.md$
+
+# Design specs and brainstorming artifacts live in-package only; never
+# symlink into $HOME. Discoverable via /docs/superpowers/specs/ in the repo.
+^/docs/
