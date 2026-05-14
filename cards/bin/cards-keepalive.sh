@@ -164,7 +164,14 @@ def evaluate(js):
     r = cdp("Runtime.evaluate", {"expression": js, "returnByValue": True, "awaitPromise": True})
     if "error" in r:
         return None, r["error"]
-    res = r.get("result", {}).get("result", {})
+    outer = r.get("result", {})
+    # CDP sets exceptionDetails at the top of the result envelope when JS throws;
+    # in that case the inner RemoteObject also has subtype:'error'. Belt-and-
+    # suspenders — check exceptionDetails first (more specific) then subtype.
+    if "exceptionDetails" in outer:
+        ex = outer["exceptionDetails"]
+        return None, {"message": ex.get("text", "js exception")}
+    res = outer.get("result", {})
     if res.get("subtype") == "error":
         return None, {"message": res.get("description", "js error")}
     return res.get("value"), None
@@ -204,6 +211,9 @@ PY
 }
 
 # probe_tab_to_state PROBE_JSON → emits one of: authed, auth-wall, vis-error, dom-error
+# Precedence: err (non-empty) > hasPwInput (truthy) > vis ≠ "visible" > authed.
+# Missing fields are treated as falsy/absent: e.g., no hasPwInput key behaves
+# as hasPwInput=false. Callers must always send a string-encoded JSON object.
 probe_tab_to_state() {
   local probe="$1"
   "$PYTHON_BIN" - "$probe" <<'PY'
