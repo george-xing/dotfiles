@@ -51,9 +51,11 @@ The skill (`.claude/skills/credit-card-offers/SKILL.md`) is the actual work: CDP
 
 The cards SKILL.md calls **twitter's** `bin/lib/telegram-send.sh` and `bin/lib/dedup-append.sh` by absolute path. Those helpers are package-generic (no twitter-specific code) but live in the twitter repo for historical reasons. **When a third consumer needs them, lift to `~/dotfiles/common/bin/lib/`** and update absolute-path references in both twitter and cards SKILL.md files. Until then, the cross-package reference is the documented choice (vs. duplicate-and-drift or extract-now-while-twitter-is-stable).
 
-Cards-specific DOM helpers live in `bin/lib/`:
-- `activate-chase.sh` — enumerate Chase Offers tiles, click each unactivated, return JSON
-- `activate-amex.sh` — same shape but iterates each card account
+Cards-specific helpers live in `bin/lib/` — kept deliberately TINY and DOM-agnostic. All DOM specifics live in `SKILL.md` so the agent can adapt at runtime when banks ship UI changes.
+- `cdp-eval.sh` — generic Runtime.evaluate primitive (find tab by URL substring, evaluate JS expression, return JSON value). Zero DOM knowledge.
+- `cdp-screenshot.sh` — generic Page.captureScreenshot primitive for forensics.
+
+Earlier versions had `activate-amex.sh` / `activate-chase.sh` with hardcoded selectors and a probe-only mode. Those were removed because banking DOMs change too often to bake into bash; the agentic SKILL.md driver replaced them.
 
 ## Operational source of truth
 

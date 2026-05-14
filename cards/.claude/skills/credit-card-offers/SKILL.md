@@ -1,210 +1,314 @@
 ---
 name: credit-card-offers
-description: Activate available Chase Offers and Amex Offers on a daily fire. Attaches via CDP to a long-running cards-bot Chrome daemon (launchctl-managed, persistent profile, debug port 19223), enumerates eligible offer tiles on each issuer's offers hub, clicks the "Add to card" button on every unactivated offer, deduplicates against per-issuer offer-ID files, and delivers a Telegram summary of merchants added, skipped, and any failures. Fires once daily at 03:00 PT via launchd. Use when the user asks for "activate my credit card offers", "Chase offers", "Amex offers", "card offer roundup", or when fired by launchd.
+description: Activate available Chase Offers and Amex Offers on a daily fire. Attaches via CDP to a long-running cards-bot Chrome daemon (launchctl-managed, persistent profile, debug port 19223), agentically inspects the offers pages, clicks the activate button on every unactivated offer, deduplicates against per-issuer state files, and delivers a Telegram summary. Fires once daily at 03:00 PT via launchd. Use when the user asks for "activate my credit card offers", "Chase offers", "Amex offers", "card offer roundup", or when fired by launchd.
 ---
 
 # Credit Card Offers
 
-Once-daily job: attach to the persistent cards-bot Chrome on `127.0.0.1:19223`, activate every available Chase + Amex offer, deliver a roundup to Telegram. Designed to be fired headlessly via `claude -p` from launchd, but works fine when invoked interactively. **No time cutoff** — the dedup is per-offer-ID and kept forever; once an offer is activated it stays in the dedup until the issuer's offer system rolls it off. This mirrors how a human uses Chase Offers / Amex Offers: open the hub, click "Add" on every offer that isn't already added, close.
+Once-daily job: attach to the persistent cards-bot Chrome on `127.0.0.1:19223`, activate every available Chase + Amex offer, deliver a roundup to Telegram. Designed to run headlessly via `claude -p` from launchd, but works fine interactively.
+
+**Key design principle:** this skill is *agentic*, not scripted. You inspect the page at runtime, identify offers, click them, and verify the outcome — using JavaScript expressions you write yourself and send via the `cdp-eval.sh` primitive. The bank UI changes frequently; do NOT bake selectors into helper scripts. Adapt to what you see. When this SKILL.md gives example selectors below, those are *current observations as of 2026-05-14* — not contracts. If a selector returns 0 elements, probe to find the new one rather than failing.
 
 The fire is daily-not-bidaily and at 03:00 PT specifically because banks pattern-match high-frequency identical sessions; off-peak + low-cadence keeps the access profile boring.
 
-## Inputs (from environment / state)
+## Primitives available to you
 
-- **Browser**: long-running daemon Chrome managed by the `com.pattybot.cards-bot-chrome` LaunchAgent, listening on `http://127.0.0.1:19223` for CDP. Persistent user-data-dir at `$HOME/Library/Application Support/cards-bot-chrome`. Auth state (Chase + Amex cookies) lives in that profile and is set by manual sign-in via the bot Chrome window during bootstrap — NOT by cookie import. **Never spawn a new browser-use Chrome with `--profile` or `--headed` — always attach via `--cdp-url`.**
-- **Dedup files**:
-  - `state/chase-activated.json` — array of `{offer_id, merchant, deal, activatedAt}` for every Chase offer ever activated. **No TTL** — offers eventually expire on the issuer's side, and the dedup file doubles as audit log. Skip activation for any offer whose `offer_id` is already in this set.
-  - `state/amex-activated.json` — same shape, keyed `{card_id, offer_id}` since the same Amex offer can appear independently across multiple cards on the same account.
+These tiny helpers handle CDP plumbing only — no DOM logic, no decisions:
+
+- **`/Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh`** — evaluate a JS expression against a tab matched by URL substring. Returns `{ok, value}` or `{ok:false, kind, message}`. Calls `Page.bringToFront` first (legit OS-level activation, NOT `Page.setWebLifecycleState`).
+  - Env: `TARGET_URL_SUBSTRING` (required), `EXPRESSION` (required), `AWAIT_PROMISE` (default true), `BRING_TO_FRONT` (default yes).
+- **`/Users/pattybot/dotfiles/cards/bin/lib/cdp-screenshot.sh`** — Page.captureScreenshot for forensics on failures.
+  - Env: `TARGET_URL_SUBSTRING` (required), `LABEL` (filename tag), writes to `state/screenshots/`.
+- **`/Users/pattybot/dotfiles/twitter/bin/lib/telegram-send.sh`** — hardened Telegram delivery with HTML body + plain fallback + one-retry-on-`ok:false`.
+- **`/Users/pattybot/dotfiles/twitter/bin/lib/dedup-append.sh`** — atomic dedup-file appends (tmp + rename).
+
+You will mostly use `cdp-eval.sh`. Wrap complex JS return values in `JSON.stringify(...)` so the value comes back as a parseable string.
+
+## Hard rules — DO NOT VIOLATE
+
+These exist because banks aggressively pattern-match automated behavior and account lockout is non-recoverable from a script:
+
+- **NEVER programmatically log in.** No typing credentials, ever. If a login wall appears, hard-fail with `kind:"auth"` and stop. The operator signs in manually via the bot Chrome window.
+- **NEVER type into ANY input field.** No search boxes, no card-rename fields. Typing is a behavioral signature.
+- **ONLY click activate-offer buttons (Amex) or offer tiles / Add-to-card buttons on detail pages (Chase).** No "Got it" modal dismissal. No "Continue" prompts. No "Skip" / "Accept" / "Agree". If a modal blocks the page, the right answer is to bail with a screenshot, not to click your way out — those modals can commit the operator to TOS terms or are detection canaries.
+- **NEVER retry a failed click.** If a click doesn't transition the offer to "Added" within a reasonable wait, record the failure and move on. Banks count failed activations as fraud signal.
+- **NEVER fake foreground state.** `Page.setWebLifecycleState("active")` is detectable. `Page.bringToFront` IS allowed (it's a real OS-level activation, and `cdp-eval.sh` already calls it).
+- **NEVER call `browser-use close --all`.** Daemon Chrome lifetime is launchd's responsibility.
+- **Cadence:** between clicks, sleep a *random* 3–6 seconds. No metronome timing. Run `sleep $(awk 'BEGIN{srand(); print 3+rand()*3}')` between clicks.
+
+If you encounter something this list doesn't cover and you're tempted to click it, the answer is to bail with `kind:"challenge"` + a screenshot, not to improvise.
+
+## Inputs
+
+- **Browser**: daemon Chrome on `http://127.0.0.1:19223` (CDP). Persistent profile holds Chase + Amex cookies. Both issuers each have ONE tab open.
+- **Dedup files** under `~/.claude/skills/credit-card-offers/state/`:
+  - `chase-activated.json` — array of `{url, merchant, deal, ...}`. `url` is the dedup KEY — `"chase::<offer_id_from_url>"` is the recommended shape.
+  - `amex-activated.json` — same shape; key is `"<card_label>::<merchant>::<deal>"` composite.
 - **Telegram bot token**: parse from `~/.claude/channels/telegram/.env` (key `TELEGRAM_BOT_TOKEN`).
 - **Telegram chat_id**: `7953915703`.
-
-## What this skill does NOT do
-
-- **Does not log in.** If either bank shows a login wall, hard-fail `kind:auth` and stop. The operator signs in manually via the bot Chrome window. Programmatic login on banking sites risks account lockout and is non-negotiable.
-- **Does not type into ANY input field, ever.** No search boxes, no card-rename fields, no credential fields. Typing on banking sites is a behavioral signature.
-- **Does not click anything except the activate-offer buttons.** No "Got it" modals, no "Continue" prompts, no card switchers beyond the documented Amex card-switching pattern. The mid-run action set is the strictest in any skill in this repo.
-- **Does not retry clicks.** If an activate button doesn't transition to "Added" after one click + wait, record the failure and move on. Banks count failed activations as a fraud signal.
-- **Does not run the session keepalive inline.** Session-keepalive is a separate launchd job (`com.pattybot.cards-keepalive`, every 5 min) that maintains the bot Chrome's Amex/Chase session liveness between fires via `Page.bringToFront` + small scroll. The fire's only interaction with the keepalive is via `state/fire-in-progress.lock` (written at fire start, removed on exit) — the keepalive honors that lock and skips iterations during fires. Don't invoke `bin/cards-keepalive.sh` from this skill. See `docs/superpowers/specs/2026-05-13-cards-session-keepalive-design.md`.
+- **Caps:** `AMEX_MAX_CLICKS` (default 25 — start conservative; raise after a week of clean fires), `CHASE_MAX_CLICKS` (default 25).
 
 ## Workflow
 
-### 1. Load dedup sets
+### 1. Load dedup state
 
 ```bash
 CHASE_ACTIVATED=~/.claude/skills/credit-card-offers/state/chase-activated.json
 AMEX_ACTIVATED=~/.claude/skills/credit-card-offers/state/amex-activated.json
-
-# Counts only — actual dedup is offer-ID-keyed in the helper scripts.
-CHASE_COUNT=$(python3 -c "
-import json, os
-p = '$CHASE_ACTIVATED'
-n = len(json.load(open(p))) if os.path.exists(p) and os.path.getsize(p) else 0
-print(n)
-")
-AMEX_COUNT=$(python3 -c "
-import json, os
-p = '$AMEX_ACTIVATED'
-n = len(json.load(open(p))) if os.path.exists(p) and os.path.getsize(p) else 0
-print(n)
-")
+CHASE_COUNT=$(/usr/bin/python3 -c "import json, os; p='$CHASE_ACTIVATED'; print(len(json.load(open(p))) if os.path.exists(p) and os.path.getsize(p) else 0)")
+AMEX_COUNT=$(/usr/bin/python3 -c "import json, os; p='$AMEX_ACTIVATED'; print(len(json.load(open(p))) if os.path.exists(p) and os.path.getsize(p) else 0)")
 echo "dedup state: chase=$CHASE_COUNT amex=$AMEX_COUNT"
 ```
 
-### 2. Activate Chase Offers
+### 2. Activate Amex offers
 
-Chase has a single offers hub regardless of card count (offers are pooled across all Chase cards on the account).
+Amex offers UI (observed 2026-05-14): a single scrolling list of offer "tiles" on `https://global.americanexpress.com/offers/eligible`. Each unactivated tile has an inline `+` icon button. After click, the button disappears from the DOM. Multi-card support is OUT OF SCOPE for v1 — process only the currently-selected card.
 
-The activator helper handles everything end-to-end on the Chase tab:
-1. Finds the Chase tab by URL substring via CDP `/json` listing.
-2. Navigates to the offers hub URL if it isn't already there.
-3. Probes the page for visibility, login wall, and offer tiles.
-4. (When `MODE=activate`, post-selector-verification) clicks each unactivated offer's "Add to card" button with jittered human-cadence delays, verifies each click landed, dedups against `chase-activated.json`.
-5. Returns a single-line JSON to stdout.
-
-Call it:
+**Step 2.1 — Pre-flight.** Use `cdp-eval` to inspect Amex state:
 
 ```bash
-CHASE_RESULT_JSON=$(
-  DAEMON_PORT=19223 \
-  DEDUP_FILE="$CHASE_ACTIVATED" \
-  MODE="activate" \
-  /Users/pattybot/dotfiles/cards/bin/lib/activate-chase.sh
-)
-CHASE_EXIT=$?
+TARGET_URL_SUBSTRING=americanexpress.com \
+EXPRESSION='JSON.stringify({
+  url: location.href,
+  title: document.title,
+  hasPwInput: !!document.querySelector("input[type=password]"),
+  cardLabel: (document.querySelector("[data-testid=simple_switcher_display_label]")?.innerText || "").trim().split(/\s+/).join(" "),
+  addBtnCount: document.querySelectorAll("[data-testid=merchantOfferListAddButton]").length
+})' \
+/Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh
 ```
 
-Result shape (when `ok: true`):
-```json
-{
-  "ok": true,
-  "issuer": "chase",
-  "tiles_seen": 12,
-  "activated": [
-    {"offer_id": "abc123", "merchant": "Costco", "deal": "10% off, max $20"},
-    ...
-  ],
-  "skipped_dedup": [{"offer_id": "xyz789", "merchant": "Apple"}],
-  "skipped_already_added": [],
-  "failures": []
-}
+Parse the response value (a JSON string). Branch:
+- `hasPwInput=true` or `title` contains "Log In": Amex is logged out → screenshot + `kind:"auth"` + skip the Amex section.
+- `url` doesn't include `/offers/eligible`: navigate, wait 5s, re-probe:
+  ```bash
+  TARGET_URL_SUBSTRING=americanexpress.com EXPRESSION='location.href = "https://global.americanexpress.com/offers/eligible"; "navigating"' /Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh
+  sleep 5
+  ```
+- `addBtnCount=0` but session looks valid: page hasn't fully rendered, or the user has activated all offers. Sleep 3s and re-probe once. If still 0, treat as empty (success with 0 activated).
+
+**Step 2.2 — The click loop.** Up to `AMEX_MAX_CLICKS` (default 25):
+
+The Add button has `[data-testid="merchantOfferListAddButton"]` with empty innerText (icon button). To identify *which* offer the next button corresponds to, walk up the parent chain from the button to the per-offer container (the div with `border` in its class). Lines of that container's innerText: line 0 = merchant, line 1 = deal description.
+
+**Each iteration** does three things — extract, dedup-check, click+verify:
+
+a. **Extract the next offer's identity:**
+```bash
+TARGET_URL_SUBSTRING=americanexpress.com \
+EXPRESSION='JSON.stringify((() => {
+  const btn = document.querySelector("[data-testid=merchantOfferListAddButton]:not([data-cards-skip])");
+  if (!btn) return null;
+  let p = btn;
+  for (let i = 0; i < 6 && p; i++) {
+    const cls = (p.className && p.className.toString) ? p.className.toString() : "";
+    if (cls.includes("border")) break;
+    p = p.parentElement;
+  }
+  const text = (p?.innerText || "").trim();
+  const lines = text.split("\n").map(s => s.trim()).filter(Boolean);
+  return { merchant: lines[0] || "<unknown>", deal: lines[1] || "" };
+})())' \
+/Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh
 ```
 
-On `ok: false` (auth/dom/challenge): record the failure-kind from the helper's output, screenshot has been written by the helper, halt the Chase phase and move to the Amex phase with Chase recorded as a partial failure. **Do not retry Chase.**
+If `value` is the JSON string `"null"` (i.e. no more Add buttons remain): exit the loop normally — you've processed everything.
 
-**The activator helper enforces these invariants** — see `/Users/pattybot/dotfiles/cards/bin/lib/activate-chase.sh`:
-- Click loop uses 3-6s jittered delays between activations (human-cadence).
-- Each click is followed by a verification probe: re-read the tile's state class; only count as `activated` if the post-click state shows "Added" / "Activated" / equivalent.
-- If the verification fails on a tile, record to `failures` (with the merchant name + a screenshot pointer) and move on — never retry the same click.
-- Stops immediately if the page DOM changes shape mid-loop (e.g., redirect to login → suggests session expired).
+b. **Dedup check.** Build key `"<cardLabel>::<merchant>::<deal>"`. If it's in `$AMEX_ACTIVATED`, mark this button so the next iteration doesn't pick it up, then continue:
+```bash
+TARGET_URL_SUBSTRING=americanexpress.com \
+EXPRESSION='document.querySelector("[data-testid=merchantOfferListAddButton]:not([data-cards-skip])")?.setAttribute("data-cards-skip", "1"); "marked"' \
+/Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh
+```
 
-### 3. Activate Amex Offers per card
+c. **Click + verify.** Read the BEFORE count, click, jittered wait, read AFTER count:
+```bash
+BEFORE=$(TARGET_URL_SUBSTRING=americanexpress.com \
+  EXPRESSION='document.querySelectorAll("[data-testid=merchantOfferListAddButton]").length' \
+  /Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh | /usr/bin/python3 -c "import sys,json; print(json.loads(sys.stdin.read())['value'])")
 
-Amex shows offers per-card. The activator iterates each card account on the page; each card has its own set of offers. Same end-to-end pattern as the Chase activator — finds the Amex tab, navigates to `/offers/eligible`, probes, activates per-card.
+TARGET_URL_SUBSTRING=americanexpress.com \
+EXPRESSION='(() => {
+  const btn = document.querySelector("[data-testid=merchantOfferListAddButton]:not([data-cards-skip])");
+  if (!btn) return "no-button";
+  btn.scrollIntoView({block:"center", behavior:"instant"});
+  btn.click();
+  return "clicked";
+})()' \
+/Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh
+
+sleep $(awk 'BEGIN{srand(); print 3+rand()*3}')
+
+AFTER=$(TARGET_URL_SUBSTRING=americanexpress.com \
+  EXPRESSION='document.querySelectorAll("[data-testid=merchantOfferListAddButton]").length' \
+  /Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh | /usr/bin/python3 -c "import sys,json; print(json.loads(sys.stdin.read())['value'])")
+```
+
+Expected: `AFTER == BEFORE - 1`. If yes, record `{merchant, deal, card_id: cardLabel}` to your in-memory activated list. If no, the click didn't take — screenshot via `cdp-screenshot.sh` (LABEL=amex-verify-fail) + record the failure and **bail the Amex section entirely** (don't keep clicking blind).
+
+Stop conditions: hit `AMEX_MAX_CLICKS`, ran out of buttons, OR encountered a verification failure.
+
+### 3. Activate Chase offers
+
+Chase is a 2-step flow (hub → detail → Add → back). And critically: Chase aggressively logs you out of the offers area. `/dashboard/overview` being logged in doesn't mean `/offers/offerHub` is — Chase requires step-up auth for offers specifically.
+
+**Step 3.1 — Pre-flight:**
 
 ```bash
-AMEX_RESULT_JSON=$(
-  DAEMON_PORT=19223 \
-  DEDUP_FILE="$AMEX_ACTIVATED" \
-  MODE="activate" \
-  /Users/pattybot/dotfiles/cards/bin/lib/activate-amex.sh
-)
-AMEX_EXIT=$?
+TARGET_URL_SUBSTRING=chase.com \
+EXPRESSION='JSON.stringify({
+  url: location.href,
+  title: document.title,
+  hasPwInput: !!document.querySelector("input[type=password]"),
+  bodyLen: (document.body && document.body.innerText || "").length
+})' \
+/Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh
 ```
 
-Result shape (multi-card):
-```json
-{
-  "ok": true,
-  "issuer": "amex",
-  "cards": [
-    {
-      "card_id": "platinum-1234",
-      "card_label": "Platinum 1234",
-      "tiles_seen": 8,
-      "activated": [{"offer_id": "...", "merchant": "...", "deal": "..."}],
-      "skipped_dedup": [],
-      "skipped_already_added": [],
-      "failures": []
-    },
-    {
-      "card_id": "gold-5678",
-      ...
-    }
-  ]
-}
+If `hasPwInput=true`, `title` matches `/sign in/i`, or `bodyLen < 200` while title indicates login: auth wall. Screenshot + `kind:"auth"` + skip Chase.
+
+Otherwise navigate to the offers hub:
+```bash
+TARGET_URL_SUBSTRING=chase.com \
+EXPRESSION='location.href = "https://secure.chase.com/web/auth/dashboard#/dashboard/offers/offerHub"; "navigating"' \
+/Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh
+sleep 8  # Chase SPA hash-routing resolves to /merchantOffers/offer-hub; slow.
 ```
 
-Same invariants as Chase: per-tile jittered delays, post-click verification, no retries, hard-stop on shape change.
+Re-probe. Expected end state: URL contains `offer-hub`, `bodyLen > 500`, and at least one element matching `[data-testid*="offerHub-tile" i]` exists.
 
-### 4. Determine overall run outcome
+**Step 3.2 — Click loop.** Up to `CHASE_MAX_CLICKS` (default 25):
 
-The wrapper has already verified `127.0.0.1:19223` responded before invoking you, and prefire foreground-activated the bot Chrome window. The activator helpers handle their own visibility / login-wall / DOM probes and emit `{ok:false, kind, message, screenshot}` JSON on failure — there's no separate "step 2 probe" any more.
+a. **Enumerate hub tiles**:
+```bash
+TARGET_URL_SUBSTRING=chase.com \
+EXPRESSION='JSON.stringify(Array.from(document.querySelectorAll("[data-testid*=offerHub-tile]")).map((t, i) => ({
+  index: i,
+  testid: t.getAttribute("data-testid"),
+  text: (t.innerText || "").trim().slice(0, 200),
+})))' \
+/Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh
+```
 
-Each helper returns one of:
-- `{ok:true, ...}` — proceed
-- `{ok:false, kind:"auth"|"mfa"|"challenge"|"visibility"|"dom", ...}` — hard fail for that issuer
+If the array is empty, no more tiles — exit Chase section.
 
+b. **Click the first tile**, which navigates to the detail page:
+```bash
+TARGET_URL_SUBSTRING=chase.com \
+EXPRESSION='(() => {
+  const tile = document.querySelector("[data-testid*=offerHub-tile]");
+  if (!tile) return "no-tile";
+  tile.scrollIntoView({block:"center"});
+  tile.click();
+  return "clicked";
+})()' \
+/Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh
+sleep 3  # detail page navigation
+```
 
+c. **On the detail page, inspect:**
+```bash
+TARGET_URL_SUBSTRING=chase.com \
+EXPRESSION='JSON.stringify((() => {
+  const merchant = (document.querySelector("h1, h2")?.innerText || "").trim().slice(0, 100);
+  const offerAmount = (document.querySelector("[data-testid*=offerAmount]")?.innerText || "").trim();
+  const alreadyAdded = !!document.querySelector("[data-testid=added-to-card-alert]");
+  const addBtn = Array.from(document.querySelectorAll("button, [role=button]")).find(b => /^add to card$|enroll|^activate offer$/i.test((b.innerText || "").trim()));
+  return {
+    url: location.href,
+    merchant, offerAmount, alreadyAdded,
+    addBtnText: addBtn ? (addBtn.innerText || "").trim() : null,
+    addBtnTestid: addBtn ? addBtn.getAttribute("data-testid") : null,
+  };
+})())' \
+/Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh
+```
 
-Three possibilities feed into the Telegram message:
+Branch:
+- `alreadyAdded=true`: record `skipped_already_added` and skip to step (g) [navigate back].
+- `addBtnText` is null: this offer's detail page doesn't have a recognizable Add button. Screenshot, record `kind:"dom"`, bail Chase.
+- Otherwise continue.
 
-- **Both succeeded** (`CHASE_EXIT == 0 && AMEX_EXIT == 0`): standard summary. `last-success.json` will reflect both counts.
-- **One succeeded, one failed** (`partial`): ship a summary that includes the successful issuer's results + a clear "couldn't reach $issuer — kind:$failure_kind" note. Mark the failed issuer's dedup state untouched (helper has already not appended). `last-failure.json` gets written with `kind: "partial"` and a list of the failed issuer + its sub-kind. **Telegram is still sent** in this case — partial is more useful than silence.
-- **Both failed** (`CHASE_EXIT != 0 && AMEX_EXIT != 0`): write `last-failure.json` with `kind: "both_failed"` and the sub-kinds. **Do NOT send Telegram** in this case — there's nothing positive to report, and the operator finds it in the log. (This mirrors twitter-digest's "no Telegram on hard-fail" rule.)
+d. **Dedup check.** The URL contains the offer ID (e.g., `offer-activated/CDLX:1000290073:1000290073-c`). Use it as the dedup key prefixed with `chase::`. If in `$CHASE_ACTIVATED`, record `skipped_dedup` and skip to step (g).
 
-### 5. Compose Telegram summary
+e. **Click the Add button:**
+```bash
+TARGET_URL_SUBSTRING=chase.com \
+EXPRESSION='(() => {
+  const btn = Array.from(document.querySelectorAll("button, [role=button]")).find(b => /^add to card$|enroll|^activate offer$/i.test((b.innerText || "").trim()));
+  if (!btn) return "no-button";
+  btn.scrollIntoView({block:"center"});
+  btn.click();
+  return "clicked";
+})()' \
+/Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh
+sleep $(awk 'BEGIN{srand(); print 3+rand()*3}')
+```
 
-Compose HTML (NOT Markdown — bank merchant names routinely contain `_*[` characters that legacy Telegram Markdown breaks on).
+f. **Verify** — expect the `added-to-card-alert` to appear:
+```bash
+TARGET_URL_SUBSTRING=chase.com \
+EXPRESSION='!!document.querySelector("[data-testid=added-to-card-alert]")' \
+/Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh
+```
 
-**HTML escaping rules** (apply LAST, after composition, so `<b>` tags survive): `&` → `&amp;`, `<` → `&lt;`, `>` → `&gt;`. Telegram HTML supports a small whitelist: `<b>`, `<i>`, `<u>`, `<s>`, `<a href="...">`, `<code>`, `<pre>`. Don't use anything else.
+If `value=true`: record `{merchant, deal: offerAmount, offer_id: <from url>}` to your chase activated list. If `false`: screenshot, record failure, bail Chase.
 
-Header uses local clock date:
+g. **Navigate back to hub** (direct URL — don't trust history.back on Chase's hash router):
+```bash
+TARGET_URL_SUBSTRING=chase.com \
+EXPRESSION='location.href = "https://secure.chase.com/web/auth/dashboard#/dashboard/offers/offerHub"; "navigating"' \
+/Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh
+sleep 5
+```
+
+After activation, the tile may have moved or been removed. Re-enumerate (step a) and pick the FIRST tile each iteration — don't trust prior indices.
+
+### 4. Determine overall outcome
+
+After both issuers run:
+- **Both succeeded**: standard digest, Telegram, advance state.
+- **Partial** (one auth-walled/errored, other succeeded): digest with a "couldn't reach <issuer>" section; advance `last-success.json` with the succeeded counts; ALSO write `last-failure.json` with `kind:"partial"` and the failing issuer's sub-kind.
+- **Both failed**: do NOT Telegram. Write `last-failure.json` and exit.
+- **Empty success** (zero new across both, no failures): ship `Nothing new today 🥱` and advance state.
+
+### 5. Compose Telegram digest (HTML)
+
+Apply the escape pipeline LAST so `<b>` tags survive: `&` → `&amp;`, `<` → `&lt;`, `>` → `&gt;`. Allowed HTML tags: `<b>`, `<i>`, `<u>`, `<s>`, `<a href>`, `<code>`, `<pre>`. Nothing else (legacy Telegram HTML mode).
+
+Format:
 
 ```
-💳 <b>Offer Roundup — &lt;date&gt;</b>
+💳 <b>Offer Roundup — <date></b>
 
-🏦 <b>Chase</b> (&lt;N&gt; new)
-• Costco — 10% off, max $20
-• DoorDash — $15 off ($40+)
-• Whole Foods — 5% back
+🏦 <b>Chase</b> (<N> new)
+• <merchant> — <deal>
+...
 
-💎 <b>Amex Gold</b> (&lt;N&gt; new)
-• Uber Eats — 5x ($50+)
-• Resy — $25 off ($75+)
-
-💎 <b>Amex Platinum</b> (&lt;N&gt; new)
-• Equinox — $50 off
-• Marriott — 10x (next stay)
+💎 <b>Amex <card_label></b> (<N> new)
+• <merchant> — <deal>
+...
 
 —
-&lt;total_activated&gt; activated • &lt;skipped_dedup&gt; previously added • &lt;failures&gt; failures
+<total> activated • <skipped_dedup> previously added • <failures> failures
 ```
 
-If a card / issuer has zero new offers, render: `• <i>no new offers</i>` under its section rather than hiding the section entirely — explicit "we checked, found nothing" is more reassuring than missing rows that could be a bug.
+Zero new in a section → `• <i>no new offers</i>`. For `partial` runs, append:
 
-If literally zero new offers across all issuers AND no failures: send a single line `Nothing new on offers today 🥱` instead of an empty multi-section template.
-
-For `partial` runs, append a section:
 ```
 ⚠️ <b>Couldn't reach</b>
-• Chase — kind:auth (re-login on Mac mini)
+• <Issuer> — kind:<failure_kind> (action: re-login on Mac mini)
 ```
 
 ### 6. Pre-send: write pending state
 
-Before calling Telegram, write `state/pending.json` so a crash mid-send leaves a recoverable trace:
-
 ```bash
 PENDING=~/.claude/skills/credit-card-offers/state/pending.json
-NOW=$(python3 -c "from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())")
-cat > "$PENDING" <<EOF
-{"runAt": "$NOW", "chaseActivated": $CHASE_ACTIVATED_COUNT, "amexActivated": $AMEX_ACTIVATED_COUNT, "telegramOk": null}
-EOF
+NOW=$(/usr/bin/python3 -c "from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())")
+echo '{"runAt": "'"$NOW"'", "chaseActivated": '"$CHASE_NEW"', "amexActivated": '"$AMEX_NEW"', "telegramOk": null}' > "$PENDING"
 ```
 
-### 7. Deliver to Telegram
-
-Reuse twitter's hardened helper (path-references the twitter package by absolute path — structural debt noted in cards CLAUDE.md):
+### 7. Deliver Telegram
 
 ```bash
 RUN_DIR=/tmp/credit-card-offers-run
@@ -220,55 +324,28 @@ RUN_DIR="$RUN_DIR" \
 TG_EXIT=$?
 ```
 
-The helper enforces the load-bearing invariants from prior production incidents (file-payload `--data-urlencode "text@<file>"`, one retry with plain-text on parseable `ok:false`, never retry on curl non-zero or local parse errors — preventing the duplicate-message bug).
-
-**On `$TG_EXIT`:**
-- `0` — sent successfully. Proceed to step 8.
-- `1` — Telegram returned `ok:false` even after plain-text retry. Write `last-failure.json` with `kind: "telegram"`. STOP. Do NOT send another Telegram message about this failure.
-- `2` — curl/network/local-parse failure. Same handling as `kind:telegram` but with network-error message.
+`TG_EXIT`: 0=ok, 1=`ok:false` even after the helper's plain-text retry, 2=network/parse. The helper does ONE internal retry on parseable `ok:false`; do not add additional retries.
 
 ### 8. On success: persist dedup FIRST, then atomic finalize
 
-**Order matters** (same reasoning as twitter-digest step 8). Append activated offers to the dedup files BEFORE advancing `last-success.json`. If dedup append fails between Telegram-succeeded and state-advance, the operator has `pending.json` as a forensic marker, and a re-fire correctly re-records the offers. Reversing the order would mark the run successful while losing the offer IDs from dedup → next fire would attempt to re-activate already-activated offers → bank's dupe-add UI behavior is undefined (best case no-op, worst case fraud flag).
-
-The helpers already returned the per-issuer activated lists. Append them via the shared `dedup-append.sh` (using path-reference to twitter helper):
+Order matters. Append activated offers to dedup files BEFORE advancing `last-success.json`. If dedup append fails between Telegram-success and state-advance, the operator has `pending.json` as a forensic marker, and a re-fire correctly re-records the offers. Reversing the order would mark the run successful while losing the offer IDs → next fire attempts re-activate → bank's dupe-add behavior is undefined.
 
 ```bash
-# Append Chase activated. Helper expects DEDUP_URLS_JSON env var, but our shape
-# is offer objects, not URLs — wrap to compatible shape: { url: offer_id, ...extras }.
-# Helper preserves additional fields on append, so the merchant/deal/activatedAt
-# all stick around in the dedup file.
-CHASE_DEDUP_PAYLOAD=$(echo "$CHASE_RESULT_JSON" | python3 -c "
-import json, sys
-r = json.load(sys.stdin)
-print(json.dumps([
-    {'url': a['offer_id'], 'merchant': a.get('merchant'), 'deal': a.get('deal')}
-    for a in r.get('activated', [])
-]))
-")
-DEDUP_FILE="$CHASE_ACTIVATED" \
-DEDUP_URLS_JSON="$CHASE_DEDUP_PAYLOAD" \
-  /Users/pattybot/dotfiles/twitter/bin/lib/dedup-append.sh
+AMEX_PAYLOAD=$(/usr/bin/python3 <<'PY'
+import json
+activated = [
+  # ...populated from your loop, each: {"merchant", "deal", "card_id"}...
+]
+print(json.dumps([{"url": f"{a['card_id']}::{a['merchant']}::{a['deal']}", "merchant": a["merchant"], "deal": a["deal"], "card_id": a["card_id"]} for a in activated]))
+PY
+)
+DEDUP_FILE="$AMEX_ACTIVATED" DEDUP_URLS_JSON="$AMEX_PAYLOAD" /Users/pattybot/dotfiles/twitter/bin/lib/dedup-append.sh
 
-# Same for Amex (flatten across cards into a single dedup-file array keyed by
-# composite "card_id::offer_id" so the same offer ID on two cards doesn't
-# false-dedup).
-AMEX_DEDUP_PAYLOAD=$(echo "$AMEX_RESULT_JSON" | python3 -c "
-import json, sys
-r = json.load(sys.stdin)
-out = []
-for card in r.get('cards', []):
-    for a in card.get('activated', []):
-        out.append({'url': f\"{card['card_id']}::{a['offer_id']}\", 'merchant': a.get('merchant'), 'deal': a.get('deal'), 'card_id': card['card_id'], 'card_label': card.get('card_label')})
-print(json.dumps(out))
-")
-DEDUP_FILE="$AMEX_ACTIVATED" \
-DEDUP_URLS_JSON="$AMEX_DEDUP_PAYLOAD" \
-  /Users/pattybot/dotfiles/twitter/bin/lib/dedup-append.sh
+# Same shape for Chase; key = "chase::<offer_id_from_url>"
+# CHASE_PAYLOAD=... DEDUP_FILE="$CHASE_ACTIVATED" /Users/pattybot/dotfiles/twitter/bin/lib/dedup-append.sh
 
-# Atomic last-success update.
 LAST_SUCCESS=~/.claude/skills/credit-card-offers/state/last-success.json
-python3 -c "
+/usr/bin/python3 -c "
 import json
 d = json.load(open('$PENDING'))
 d['telegramOk'] = True
@@ -276,55 +353,45 @@ json.dump(d, open('$PENDING.tmp', 'w'))
 " && mv "$PENDING.tmp" "$LAST_SUCCESS" && rm -f "$PENDING"
 ```
 
-The dedup-append helper handles idempotent appends, no-TTL (we pass no `DEDUP_TTL_DAYS`), and atomic write via PID-suffixed tmp + os.replace.
-
-**Do NOT** call `browser-use close --all` — the daemon Chrome is launchd-managed and must keep running.
+**Do NOT call `browser-use close --all`** — daemon Chrome lifetime is launchd's.
 
 ## Dry-run mode
 
-If invoked with "dry-run" or "--dry-run" in the prompt: do everything *except* steps 6-8 — call the activator helpers in `MODE=probe` (enumerate only, no clicks), print the composed summary HTML to stdout, skip pending.json, skip Telegram, skip dedup updates. Useful for verifying selectors against the live DOM without spamming the chat or accidentally activating things.
+Invoked with `"dry-run"` or `"--dry-run"` in the prompt: do all probes via `cdp-eval`, compose the digest HTML, print it to stdout. **Skip clicks, skip pending.json, skip Telegram, skip dedup**. Use this to validate page state without side effects.
 
-```bash
-# Probe-only call (replace MODE=activate with MODE=probe in steps 2 + 3).
-CHASE_RESULT_JSON=$(
-  DAEMON_PORT=19223 \
-  DEDUP_FILE="$CHASE_ACTIVATED" \
-  MODE="probe" \
-  /Users/pattybot/dotfiles/cards/bin/lib/activate-chase.sh
-)
-```
-
-Do NOT call `browser-use close --all` even in dry-run.
+To skip clicks while still walking the loop logic: short-circuit the click step (replace each click eval with a no-op echo). To skip Telegram: don't invoke `telegram-send.sh`.
 
 ## Failure handling
 
-Categorize failures and write `state/last-failure.json` with `{kind, at, message, screenshot}` (screenshot optional — `null` if not captured). The activator helpers screenshot automatically on every failure path.
+Categorize and write `state/last-failure.json` with `{kind, at, message, screenshot}`:
 
-`kind` values:
+- `kind: "auth"` — login wall on an issuer. Operator action: re-login via the bot Chrome window.
+- `kind: "mfa"` — MFA challenge mid-run. Operator completes manually.
+- `kind: "challenge"` — CAPTCHA / "is this you?" / device-verify. Operator handles. Recurrence suggests bumping the inter-run gap or revisiting cadence.
+- `kind: "dom"` — selectors didn't match what SKILL.md guidance suggested. Operator inspects the screenshot; may update SKILL.md if bank UI changed.
+- `kind: "partial"` — one issuer succeeded, the other failed. Telegram IS sent (with the partial warning).
+- `kind: "both_failed"` — no Telegram. Operator finds it in logs.
+- `kind: "telegram"` — Telegram failure even after the plain-text retry.
+- `kind: "empty"` — zero new across both issuers, no failures. Treated as success.
+- `kind: "visibility"` — `document.visibilityState !== "visible"` on the issuer's tab. Bot Chrome backgrounded.
 
-- `kind: "visibility"` — bot Chrome window not foreground. Operator brings window front, re-fires.
-- `kind: "auth"` — login wall on Chase or Amex tab. Operator re-logs in via the bot Chrome window. Message identifies which issuer.
-- `kind: "mfa"` — MFA challenge mid-run (SMS code prompt, app push prompt). Operator completes via the bot Chrome window manually.
-- `kind: "challenge"` — CAPTCHA / "is this you?" / device-verification screen. Operator handles via the bot Chrome window. If recurring, consider increasing the inter-run gap (e.g. every 2 days instead of daily) — it's a sign the bank's bot-detection is flagging the cadence.
-- `kind: "dom"` — selectors no longer match. Operator updates selectors in the activator helper (`bin/lib/activate-chase.sh` or `activate-amex.sh`) using the failure screenshot as ground truth.
-- `kind: "partial"` — one issuer succeeded, the other failed. Telegram digest IS sent (with the partial warning section). The successful issuer's dedup advances normally.
-- `kind: "both_failed"` — both issuers failed in the same fire. NO Telegram sent. Operator finds the failure in `~/Library/Logs/cards-fire.log` and last-failure.json.
-- `kind: "telegram"` — Telegram delivery failed even after the plain-text retry.
-- `kind: "empty"` — no new offers across both issuers, no failures. Treated as success: `last-success.json` advances with both counts at 0, `Nothing new today 🥱` message ships.
-
-In hard-fail cases (visibility / auth / mfa / challenge / dom / both_failed), do NOT advance `last-success.json`. Partial cases DO advance `last-success.json` (with the successful issuer's counts) AND write `last-failure.json` simultaneously — partial is a hybrid state.
+Hard-fail cases (auth/mfa/challenge/dom/both_failed): do NOT advance `last-success.json`. Partial DOES advance (with the successful counts) AND writes `last-failure.json`.
 
 ## What NOT to do
 
-- **Do not spawn a fresh browser-use Chrome.** Always attach via `--cdp-url http://127.0.0.1:19223`. Spawning would create an ephemeral profile with no cookies, hitting the login wall immediately.
-- **Do not call `browser-use close --all`.** Daemon Chrome lifetime is launchd's responsibility, not the skill's.
-- **Do not try to log in programmatically.** Banks flag automated logins. Operator must sign in manually via the bot Chrome window.
-- **Do not type into any input field.** Bank fraud teams pattern-match keystroke timing; even non-credential typing (search, card-rename) is a signature.
-- **Do not click any button outside the activate-offer button class.** No modal-dismiss clicks, no card-switcher clicks beyond the documented Amex per-card iteration. Even harmless-looking "Got it" / "Continue" prompts may bind you to TOS/consent terms.
-- **Do not retry an activation click.** If the post-click verification doesn't show "Added", record as failure and move on. Banks count failed attempts.
-- **Do not run more often than daily.** Hourly or sub-hourly fires would burn the trusted-device cookie within days. The plist (when added in phase 4) is daily at 03:00 PT specifically.
-- **Do not fake the foreground state.** CDP `Page.setWebLifecycleState("active")` produces a detectable mismatch. Hard-fail and require operator to actually bring the window foreground. `Page.bringToFront` IS allowed as a single self-recovery attempt (same reasoning as twitter-digest step 2 — it's a legitimate OS activation call).
-- **Do not advance state on Telegram failure.** A failed send must NOT update `last-success.json`.
-- **Do not send a Telegram error message when Telegram itself is the failure.** Log locally and exit.
-- **Do not send a Telegram message on `both_failed`.** No positive content to report; operator finds it in the log.
-- **Do not write to `state/keepalive-events.jsonl`, `state/auth-notify-cooldown.json`, or `state/fire-in-progress.lock`.** Those are owned by `cards-keepalive.sh` and `cards-fire.sh`'s wrapper layer respectively. The skill's writes go to `state/last-success.json`, `state/last-failure.json`, `state/pending.json`, and the dedup files only. Strict file ownership is part of the keepalive's defensive design.
+Restating the hard rules and adding observed-mistake patterns:
+
+- **Do not spawn a fresh `browser-use` Chrome.** Always attach via direct CDP to port 19223.
+- **Do not call `browser-use close --all`.**
+- **Do not log in programmatically.**
+- **Do not type into any input field.**
+- **Do not click anything outside activate-offer buttons** (Amex) or **offer tiles / Add buttons on detail pages** (Chase). No modal-dismiss clicks. No "Continue" / "Got it" / "Skip".
+- **Do not retry a failed click.** One click, one verify, move on.
+- **Do not run more often than daily.** The plist is 03:00 PT daily for a reason.
+- **Do not fake foreground state via `Page.setWebLifecycleState`.** `Page.bringToFront` is allowed and `cdp-eval.sh` already calls it.
+- **Do not advance `last-success.json` on Telegram failure.**
+- **Do not send a Telegram error message when Telegram itself is the failure.**
+- **Do not send a Telegram message on `both_failed`.**
+- **Do not write to `state/keepalive-events.jsonl`, `state/auth-notify-cooldown.json`, or `state/fire-in-progress.lock`.** Those are owned by `cards-keepalive.sh` and `cards-fire.sh` respectively. Your writes go to `last-success.json`, `last-failure.json`, `pending.json`, and the dedup files only.
+- **Do not bake DOM selectors into bash files.** The selectors in this SKILL.md (e.g. `merchantOfferListAddButton`, `offerHub-tile`, `added-to-card-alert`) are *observations*, not contracts. When a selector returns 0 unexpectedly, probe to find the new pattern at runtime; if a fundamental shift, update this SKILL.md guidance.
+- **Do not run the keepalive inline.** Session-keepalive is a separate launchd job (`com.pattybot.cards-keepalive`); your only interaction is `state/fire-in-progress.lock` (the fire wrapper writes it at start and removes via trap).
