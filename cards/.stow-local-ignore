@@ -1,0 +1,13 @@
+# Stow ignore patterns for the cards package.
+#
+# Files matched here are kept in the package as in-repo documentation but
+# NOT symlinked into $HOME by `stow -t ~ cards`.
+
+# Top-level CLAUDE.md — twitter already owns ~/CLAUDE.md (claim-on-first-package).
+# Cards documentation lives in-package; Claude auto-discovers it via tree-walk
+# from any cwd under ~/dotfiles/cards/.
+^/CLAUDE\.md$
+
+# Design specs and brainstorming artifacts live in-package only; never
+# symlink into $HOME. Discoverable via /docs/superpowers/specs/ in the repo.
+^/docs/

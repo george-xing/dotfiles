@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pattybot.cards-bot-chrome</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/Google Chrome.app/Contents/MacOS/Google Chrome</string>
+        <string>--user-data-dir=/Users/pattybot/Library/Application Support/cards-bot-chrome</string>
+        <string>--remote-debugging-port=19223</string>
+        <string>--no-first-run</string>
+        <string>--no-default-browser-check</string>
+    </array>
+
+    <!--
+        Mirrors twitter-bot-chrome.plist exactly. Different port (19223 vs
+        9222) and different user-data-dir (cards-bot-chrome vs twitter-bot-chrome)
+        are the only divergences. Both Chromes coexist because Chromium's
+        process singleton is keyed on --user-data-dir.
+
+        KeepAlive implies an initial speculative launch (per launchd.plist(5)),
+        so RunAtLoad is intentionally omitted. ExitTimeOut gives Chrome 30s
+        to flush its profile state on bootout — critical so the bank
+        cookie/session SQLite writes don't get truncated mid-write.
+
+        ProcessType=Interactive is required for two reasons: the daemon
+        Chrome needs to render, AND the prefire's System Events activation
+        path needs the process to be addressable as a frontmost candidate.
+    -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/pattybot/Library/Logs/cards-bot-chrome.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/pattybot/Library/Logs/cards-bot-chrome.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/pattybot</string>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
