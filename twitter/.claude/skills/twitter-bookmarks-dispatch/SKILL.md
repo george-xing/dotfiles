@@ -1,6 +1,6 @@
 ---
 name: twitter-bookmarks-dispatch
-description: Dispatch a twitter-bookmarks fire in response to a Telegram DM. Use ONLY when a Telegram message arrives in this paired session matching trigger phrases like "/bookmarks", "read my bookmarks", "summarize my bookmarks", "bookmark digest", or "bookmark recap". Does NOT run the scrape itself — launches it as a background Agent so this session stays responsive.
+description: Dispatch a twitter-bookmarks fire in response to a Telegram DM. Use ONLY when a Telegram message arrives in this paired session matching trigger phrases like "/bookmarks", "read my bookmarks", "summarize my bookmarks", "show me my bookmarks", "what's in my bookmarks", "bookmarks summary", "bookmark digest", "bookmark roundup", or "bookmark recap". Does NOT run the scrape itself — launches it as a background Agent so this session stays responsive.
 ---
 
 # Twitter Bookmarks Dispatch
@@ -12,7 +12,11 @@ Runs in your paired Claude Code session. When a Telegram DM matches a bookmark-t
 - `/bookmarks`
 - `read my bookmarks`
 - `summarize my bookmarks`
+- `show me my bookmarks`
+- `what's in my bookmarks`
+- `bookmarks summary`
 - `bookmark digest`
+- `bookmark roundup`
 - `bookmark recap`
 
 ## Dispatch workflow
