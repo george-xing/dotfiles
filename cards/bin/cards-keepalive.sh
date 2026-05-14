@@ -77,6 +77,17 @@ state_diff_is_notifiable() {
   esac
 }
 
+# lock_is_stale NOW_EPOCH LOCK_MTIME_EPOCH STALE_SEC → "yes" | "no"
+# Returns yes when the lock's mtime is older than STALE_SEC ago.
+lock_is_stale() {
+  local now="$1" mtime="$2" cap="$3"
+  if (( now - mtime > cap )); then
+    echo "yes"
+  else
+    echo "no"
+  fi
+}
+
 # ----------------------------------------------------------------------------
 # Selftest harness — runs pure-function assertions and exits.
 # Invoked with: KEEPALIVE_SELFTEST=1 ./cards-keepalive.sh
@@ -132,6 +143,17 @@ if [[ "${KEEPALIVE_SELFTEST:-0}" == "1" ]]; then
     "no" "$(state_diff_is_notifiable authed vis-error)"
   assert_eq "diff: authed→dom-error" \
     "no" "$(state_diff_is_notifiable authed dom-error)"
+
+  # lock_is_stale(now_epoch, lock_mtime_epoch, stale_sec) → "yes" or "no"
+  # (Tested at the 60-min boundary that matches STALE_LOCK_SEC in production.)
+  assert_eq "lock: 0s old" \
+    "no" "$(lock_is_stale 1700000000 1700000000 3600)"
+  assert_eq "lock: 59:59 old (just under cap)" \
+    "no" "$(lock_is_stale 1700003599 1700000000 3600)"
+  assert_eq "lock: 60:01 old (just over cap)" \
+    "yes" "$(lock_is_stale 1700003601 1700000000 3600)"
+  assert_eq "lock: 7d old" \
+    "yes" "$(lock_is_stale 1700604800 1700000000 3600)"
 
   # Pure-function selftests will be added in subsequent tasks.
   # See: cooldown_should_send (Task 2), state_diff_is_notifiable (Task 3),
