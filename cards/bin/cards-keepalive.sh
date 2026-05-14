@@ -520,7 +520,139 @@ if [[ "${KEEPALIVE_SELFTEST:-0}" == "1" ]]; then
 fi
 
 # ----------------------------------------------------------------------------
-# Main flow (stubbed until later tasks).
+# Main flow — one shot per launchd invocation.
 # ----------------------------------------------------------------------------
-echo "cards-keepalive: main flow not yet implemented" >&2
+
+mkdir -p "$STATE_DIR" || {
+  echo "cards-keepalive: cannot create state dir $STATE_DIR" >&2
+  exit 1
+}
+
+# 1. Jitter sleep (breaks perfect-cadence pattern).
+sleep $((RANDOM % (JITTER_MAX_SEC + 1)))
+
+# 2. Lock check — PID-alive first, mtime cap as tertiary fallback (vs PID reuse).
+if [[ -f "$LOCK_FILE" ]]; then
+  now_epoch=$(date +%s)
+  lock_mtime=$(stat -f %m "$LOCK_FILE" 2>/dev/null || echo 0)
+  lock_pid=$(awk '{print $1}' "$LOCK_FILE" 2>/dev/null)
+
+  if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+    # Lock holder PID is alive. Defer unless lock is older than 60-min cap
+    # (which would suggest a coincidental PID reuse of a long-dead fire).
+    if [[ "$(lock_is_stale "$now_epoch" "$lock_mtime" "$STALE_LOCK_SEC")" == "no" ]]; then
+      # Active fire in progress — defer silently.
+      exit 0
+    fi
+    # PID matches but lock is suspiciously old → likely PID reuse; proceed
+    # with a warning logged so an operator can investigate.
+    printf "%s stale-lock proceed (pid=%s alive but lock-age>%s, PID reuse?)\n" \
+      "$(date -u +%FT%TZ)" "$lock_pid" "$STALE_LOCK_SEC" >> "$LOG_FILE"
+  else
+    # Lock-holder PID is dead, missing, or unparseable. Proceed.
+    if [[ "$(lock_is_stale "$now_epoch" "$lock_mtime" "$STALE_LOCK_SEC")" == "no" ]]; then
+      # Lock is recent but PID is dead — fire crashed without firing its trap.
+      printf "%s orphan-lock proceed (pid=%s dead, mtime=%s)\n" \
+        "$(date -u +%FT%TZ)" "${lock_pid:-?}" "$lock_mtime" >> "$LOG_FILE"
+    else
+      printf "%s stale-lock proceed (pid=%s dead, lock-age>%s)\n" \
+        "$(date -u +%FT%TZ)" "${lock_pid:-?}" "$STALE_LOCK_SEC" >> "$LOG_FILE"
+    fi
+  fi
+fi
+
+# 3. Discover tabs.
+discover_rc=0
+tabs_out=$(discover_tabs) || discover_rc=$?
+if [[ $discover_rc -eq 2 ]]; then
+  # Daemon unreachable.
+  now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  prev_daemon=$(last_state_for both)
+  if [[ "$prev_daemon" != "daemon-down" ]]; then
+    append_event both "$prev_daemon" daemon-down "curl /json failed"
+    last_sent=$(cooldown_get daemon)
+    if [[ "$(cooldown_should_send "$last_sent" "$now_iso" "$COOLDOWN_SEC")" == "yes" ]]; then
+      if send_telegram_notify daemon "$prev_daemon" daemon-down ""; then
+        cooldown_set daemon "$now_iso"
+        printf "%s daemon %s→daemon-down telegram-sent\n" "$now_iso" "$prev_daemon" >> "$LOG_FILE"
+      else
+        printf "%s daemon %s→daemon-down telegram-failed\n" "$now_iso" "$prev_daemon" >> "$LOG_FILE"
+      fi
+    else
+      printf "%s daemon %s→daemon-down throttled\n" "$now_iso" "$prev_daemon" >> "$LOG_FILE"
+    fi
+  fi
+  exit 2
+fi
+if [[ $discover_rc -eq 3 ]]; then
+  # Malformed JSON from CDP /json — chrome is responding but broken.
+  # Record as dom-error (silent per OD8) for both issuers, exit 0.
+  now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  for issuer in amex chase; do
+    prev=$(last_state_for "$issuer")
+    if [[ "$prev" != "dom-error" ]]; then
+      append_event "$issuer" "$prev" dom-error "discover_tabs: malformed /json"
+      printf "%s %s %s→dom-error silent\n" "$now_iso" "$issuer" "$prev" >> "$LOG_FILE"
+    fi
+  done
+  exit 0
+fi
+if [[ $discover_rc -ne 0 ]]; then
+  printf "%s discover_tabs unexpected rc=%d\n" \
+    "$(date -u +%FT%TZ)" "$discover_rc" >> "$LOG_FILE"
+  exit "$discover_rc"
+fi
+
+# 4. Per-tab work.
+while IFS='|' read -r issuer ws_url page_url; do
+  [[ -z "$issuer" ]] && continue
+  prev=$(last_state_for "$issuer")
+
+  # 4a. tab-missing → no probe, transition immediately.
+  if [[ -z "$ws_url" ]]; then
+    new="tab-missing"
+  else
+    probe=$(probe_tab "$ws_url")
+    new=$(probe_tab_to_state "$probe")
+  fi
+
+  # 4b. Diff.
+  if [[ "$prev" == "$new" ]]; then
+    continue
+  fi
+
+  # 4c. Capture screenshot for notifiable transitions only.
+  screenshot=""
+  if [[ "$(state_diff_is_notifiable "$prev" "$new")" == "yes" && -n "$ws_url" ]]; then
+    screenshot=$(capture_screenshot "$ws_url" "$issuer" "$new")
+  fi
+
+  # 4d. Record the transition.
+  note="detected by keepalive"
+  if [[ "$prev" == "unknown" ]]; then
+    note="first-observation"
+  elif [[ "$new" == "authed" ]]; then
+    note="operator-relogin (inferred)"
+  fi
+  append_event "$issuer" "$prev" "$new" "$note" "$screenshot"
+
+  # 4e. Telegram if notifiable, subject to cooldown.
+  if [[ "$(state_diff_is_notifiable "$prev" "$new")" == "yes" ]]; then
+    now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    last_sent=$(cooldown_get "$issuer")
+    if [[ "$(cooldown_should_send "$last_sent" "$now_iso" "$COOLDOWN_SEC")" == "yes" ]]; then
+      if send_telegram_notify "$issuer" "$prev" "$new" "$screenshot"; then
+        cooldown_set "$issuer" "$now_iso"
+        printf "%s %s %s→%s telegram-sent\n" "$now_iso" "$issuer" "$prev" "$new" >> "$LOG_FILE"
+      else
+        printf "%s %s %s→%s telegram-failed\n" "$now_iso" "$issuer" "$prev" "$new" >> "$LOG_FILE"
+      fi
+    else
+      printf "%s %s %s→%s throttled\n" "$now_iso" "$issuer" "$prev" "$new" >> "$LOG_FILE"
+    fi
+  else
+    printf "%s %s %s→%s silent\n" "$(date -u +%FT%TZ)" "$issuer" "$prev" "$new" >> "$LOG_FILE"
+  fi
+done <<< "$tabs_out"
+
 exit 0
