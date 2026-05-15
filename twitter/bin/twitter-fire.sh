@@ -66,6 +66,57 @@ write_failure() {
     > "${state_dir}/last-failure.json" 2>/dev/null || true
 }
 
+# Sibling Chrome daemons that share Google Chrome.app's NSApplication and would
+# occlude bot Chrome via macOS window-server z-order. Per
+# project_twitter_digest_macmini_arch.md, bot Chrome must be the SOLE Chrome in
+# pattybot's session for vis:visible to hold reliably under launchd-fired runs
+# (where osascript activation gets denied by TCC and the skill's Page.bringToFront
+# recovery can't always overcome a sibling occluder).
+#
+# Strategy: snapshot which sibling jobs are loaded right now, bootout each one,
+# fire the digest, then bootstrap them back from their plists. The restore runs
+# in the EXIT trap so it survives claude crashes, prefire failures, and signals.
+SIBLING_CHROME_LABELS=(
+  com.pattybot.cards-bot-chrome
+  com.pattybot.cards-keepalive
+)
+BOOTOUTED_SIBLINGS=()
+
+bootout_sibling_chromes() {
+  local label uid
+  uid=$(id -u)
+  for label in "${SIBLING_CHROME_LABELS[@]}"; do
+    if launchctl list "$label" >/dev/null 2>&1; then
+      if launchctl bootout "gui/${uid}/${label}" 2>/dev/null; then
+        BOOTOUTED_SIBLINGS+=("$label")
+        echo "  sibling-bootout: $label"
+      else
+        echo "  sibling-bootout: WARN $label bootout failed (proceeding anyway)"
+      fi
+    fi
+  done
+  # Give WindowServer a beat to fire the un-occlusion event on bot Chrome before
+  # prefire's CDP un-minimize / activation runs against a possibly-stale state.
+  [ ${#BOOTOUTED_SIBLINGS[@]} -gt 0 ] && sleep 2
+}
+
+restore_sibling_chromes() {
+  local label plist uid
+  uid=$(id -u)
+  for label in "${BOOTOUTED_SIBLINGS[@]}"; do
+    plist="$HOME/Library/LaunchAgents/${label}.plist"
+    if [ ! -f "$plist" ]; then
+      echo "  sibling-restore: WARN plist missing at $plist; cannot restore $label"
+      continue
+    fi
+    if launchctl bootstrap "gui/${uid}" "$plist" 2>/dev/null; then
+      echo "  sibling-restore: $label"
+    else
+      echo "  sibling-restore: WARN $label bootstrap failed — manual restart needed"
+    fi
+  done
+}
+
 if [ -z "$SKILL_NAME" ]; then
   echo "usage: twitter-fire.sh <skill-name> [--dry-run]" >&2
   exit 64
@@ -103,11 +154,16 @@ if ! "$SHLOCK_BIN" -p $$ -f "$LOCK_FILE"; then
   exit 3
 fi
 
-# Ensure lock is released on any exit path.
-trap 'rm -f "$LOCK_FILE"' EXIT INT TERM
+# Ensure lock is released and sibling Chrome daemons are restored on any exit
+# path (claude crash, signal, prefire failure). Group the redirect so the
+# trap's output lands in $LOG — the orchestration block's redirect closes
+# before the trap fires.
+trap '{ restore_sibling_chromes; rm -f "$LOCK_FILE"; } >> "$LOG" 2>&1' EXIT INT TERM
 
 {
   echo "===== fire $(iso_utc_now) skill=${SKILL_NAME} ====="
+
+  bootout_sibling_chromes
 
   # Call prefire, capture stdout for SAVED_FRONTMOST_PID parsing.
   PREFIRE_OUT=$("$PREFIRE_BIN" 2>&1)
