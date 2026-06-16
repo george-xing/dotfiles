@@ -1,20 +1,21 @@
 ---
 name: twitter-digest
-description: Generate the X (Twitter) digest — attaches via CDP to a long-running bot Chrome daemon (launchctl-managed, persistent profile, debug port 9222), scrolls x.com/home, themes content since the last run (AI / Startups / NYC / Random), separately flags + summarizes any long-form X Articles, and delivers to Telegram. Fires twice daily via launchd — morning at 08:00 ET (overnight recap) and evening at 22:00 ET (daytime recap). Use when the user asks for "twitter digest", "morning digest", "evening recap", "X digest", "what's new on twitter", or when fired by launchd.
+description: Generate the X (Twitter) digest — attaches via CDP to a long-running bot Chrome daemon (launchctl-managed, persistent profile, debug port 9222), scrolls x.com/home, scores candidate posts, writes a candidate audit, groups selected posts into dynamic sections, separately flags + summarizes any long-form X Articles, and delivers to Telegram. Fires twice daily via launchd — morning at 08:00 ET (overnight recap) and evening at 22:00 ET (daytime recap). Use when the user asks for "twitter digest", "morning digest", "evening recap", "X digest", "what's new on twitter", or when fired by launchd.
 ---
 
 # Twitter Digest
 
-Twice-daily job: attach to the persistent bot Chrome on `127.0.0.1:9222`, scroll x.com/home, summarize themed content into Telegram. The two scheduled fires are 08:00 ET (overnight recap) and 22:00 ET (daytime recap). **No time cutoff** — the natural stop signal is URL dedup against `state/digested-urls.json` (we don't repeat anything we've already summarized) + the 3-min wall budget + feed plateau. This mirrors how a human reads X: scroll until you recognize stuff you've already seen, then stop. Designed to be fired headlessly via `claude -p` from launchd, but works fine when invoked interactively.
+Twice-daily job: attach to the persistent bot Chrome on `127.0.0.1:9222`, scroll x.com/home, score candidate posts, write a candidate audit, summarize selected content into dynamic Telegram sections. The two scheduled fires are 08:00 ET (overnight recap) and 22:00 ET (daytime recap). **No time cutoff** — the natural stop signal is URL dedup against `state/digested-urls.json` (we don't repeat anything we've already summarized) + the 3-min wall budget + feed plateau. This mirrors how a human reads X: scroll until you recognize stuff you've already seen, then stop. Designed to be fired headlessly via `claude -p` from launchd, but works fine when invoked interactively.
 
 ## Inputs (from environment / state)
 
 - **Browser**: long-running daemon Chrome managed by the `com.pattybot.twitter-bot-chrome` LaunchAgent, listening on `http://127.0.0.1:9222` for CDP. Persistent user-data-dir at `$HOME/Library/Application Support/twitter-bot-chrome`. Auth state (X cookies) lives in that profile and is set by manual sign-in via the bot Chrome window — NOT by cookie import. **Never spawn a new browser-use Chrome with `--profile` or `--headed` — always attach via `--cdp-url`.**
 - **Lookback**: no time cutoff. URL dedup is the natural stop signal — a human reads until they recognize already-seen content.
-- **URL dedup**: `state/digested-urls.json` is an array of `{url, digestedAt}` entries listing every `statusUrl` actually summarized in a prior run. At extract time, drop any tweet whose `statusUrl` is in this set. After a successful run, append the URLs of summarized bullets and prune entries older than 7 days. (7d TTL is enough — X's For You almost never re-surfaces anything older than ~3 days, so URLs falling out of the dedup set won't realistically come back.)
+- **URL dedup**: `state/digested-urls.json` is an array of `{url, digestedAt}` entries listing every `statusUrl` actually shipped in a prior run. At extract time, drop any tweet whose `statusUrl` is in this set. After a successful run, append only URLs whose audit row has `shipped:true` and prune entries older than 7 days. (7d TTL is enough — X's For You almost never re-surfaces anything older than ~3 days, so URLs falling out of the dedup set won't realistically come back.)
+- **Candidate audit**: every run writes `state/candidate-audits/<runAt>.json` with every unique extracted tile that had enough structure to reason about, including drafted posts, shipped posts, rejected posts, and hard-filtered-but-explainable posts such as promoted / already-digested / no-status-url. This is the product feedback loop for checking whether useful posts are being filtered out.
 - **Telegram bot token**: parse from `~/.claude/channels/telegram/.env` (key `TELEGRAM_BOT_TOKEN`).
 - **Telegram chat_id**: `7953915703`.
-- **Themes**: read `references/themes.md` before composing — edits to that file flow into the next digest with no other change.
+- **Selection guide**: read `references/themes.md` before composing. It defines interest anchors, scoring dimensions, dynamic section behavior, and rejection reason codes. Edits to that file flow into the next digest with no other change.
 
 ## Workflow
 
@@ -61,26 +62,11 @@ Expected: `vis === "visible"`, `iw > 0`, `ih > 0`, `title === "Home / X"`, `hasP
 
 **Failure semantics — hard fail with the matching `kind`, do NOT paper over:**
 
-- `vis !== "visible"` or `iw === 0` → daemon Chrome window is backgrounded. **First attempt CDP self-recovery via `Page.bringToFront`, then re-probe.** Unlike page-lifecycle hacks, `Page.bringToFront` is not fakery — Chromium's `PageHandler::BringToFront` calls `WebContentsImpl::Activate()` + `Focus()`, which on macOS dispatches the same `[NSWindow makeKeyAndOrderFront:]` path a real user click triggers (see `content/browser/devtools/protocol/page_handler.cc:1683`). If `vis` flips to `"visible"` after the call, page and OS state genuinely agree — no mismatch to detect, proceed normally. If `vis` is still `"hidden"` (macOS can resist background-process focus-steal under some conditions), hard-fail: write `state/last-failure.json` with `{ "kind": "visibility", "at": "<iso>", "message": "bot Chrome window not foreground; vis=<state> after bringToFront retry" }` and exit non-zero. Do **NOT** fall back to `Page.setWebLifecycleState("active")` — that one *is* fakery (changes only page lifecycle, OS state stays backgrounded → genuine detectable mismatch). Operator action on hard-fail: bring the bot Chrome window front manually (Mission Control, click the window) and re-fire.
+- `vis !== "visible"` or `iw === 0` → try CDP `Page.bringToFront` once, wait 1s, then re-probe. If still not visible, write `kind:"visibility"` and exit non-zero. Never use `Page.setWebLifecycleState("active")`.
+- `hasLoginWall === true` or `title` matches the public landing → write `kind:"auth"` and exit. Do not attempt login.
+- `hasPrimaryColumn === false` despite `vis === "visible"` and no login wall → write `kind:"dom"` and exit.
 
-  CDP call snippet (python3 + websocket-client, same pattern as the wrapper's un-minimize step):
-  ```bash
-  /usr/bin/python3 - <<'PY'
-  import json, urllib.request, websocket
-  pages = [t for t in json.loads(urllib.request.urlopen("http://127.0.0.1:9222/json").read())
-           if t.get("type") == "page" and "x.com" in t.get("url", "")]
-  ws = websocket.create_connection(pages[0]["webSocketDebuggerUrl"], suppress_origin=True, timeout=3)
-  ws.send(json.dumps({"id": 1, "method": "Page.bringToFront"}))
-  while True:
-      r = json.loads(ws.recv())
-      if r.get("id") == 1: print("bringToFront:", r); break
-  ws.close()
-  PY
-  sleep 1
-  # then re-run the visibility probe from above
-  ```
-- `hasLoginWall === true` or `title` matches the public landing → cookies expired. Write `state/last-failure.json` with `{ "kind": "auth", "at": "<iso>", "message": "bot Chrome session logged out; sign in via the bot window" }` and exit. Do NOT attempt to log in. Operator action: focus the bot Chrome window, navigate to `https://x.com/i/flow/login`, sign in. The cookies persist in the daemon's profile across restarts.
-- `hasPrimaryColumn === false` despite `vis === "visible"` and no login wall → DOM rendered but timeline container missing. Likely an X UI change; write `kind: "dom"` failure and exit. Operator updates selectors in this skill.
+For operator recovery detail, see `references/runbook.md`. For the Page.bringToFront rationale and rejected visibility fixes, see `references/recovery-tactics.md`.
 
 ### 2b. Refresh feed via Home-tab click
 
@@ -117,7 +103,7 @@ sleep 2
 
 This step is intentionally framed as "goal + sanctioned toolkit," not a prescribed loop. The For You feed has many soft-failure modes — algorithmic cold-start, modal interstitials, mid-run prefetch hiccups, virtualization glitches, transient throttles. A rigid "scroll-stall-ship" loop ships thin digests on any of them. The runtime should iterate tactics from the toolkit until the budget is exhausted, the feed plateaus convincingly, or every sanctioned tactic has been tried without yielding new content.
 
-A useful internal target is **~50 substantive tweets** — enough to triage 2-3 substantive bullets per theme. Don't stop early on hitting it; don't fail or escalate on missing it. It's a "is this run going well?" indicator that shapes how aggressively to recover from stalls (well below → keep trying recovery tactics; well above → let plateaus end naturally).
+A useful internal target is **~50 substantive tweets** — enough to triage 2-3 substantive bullets per cluster. Don't stop early on hitting it; don't fail or escalate on missing it. It's a "is this run going well?" indicator that shapes how aggressively to recover from stalls (well below → keep trying recovery tactics; well above → let plateaus end naturally).
 
 #### Sanctioned tactic toolkit
 
@@ -158,7 +144,7 @@ The only mutating actions allowed in step 3. Apply in whatever order the observe
    - The For You feed is convincingly exhausted (3a screenshot shows "you're all caught up" / repeated tweets / no obstruction, AND no recovery tactic has any caps remaining), OR
    - A hard-fail `kind` is set.
 
-   Don't stop early on hitting 50 — content quality scales with volume (more raw → better triage → more substantive bullets per theme), so always burn the full wall budget when content's flowing. Use `len(seen)` against 50 to decide how patient to be at stalls: well under → spend a recovery cap to push through; well over → let the plateau end naturally.
+   Don't stop early on hitting 50 — content quality scales with volume (more raw → better triage → more substantive bullets per dynamic section), so always burn the full wall budget when content's flowing. Use `len(seen)` against 50 to decide how patient to be at stalls: well under → spend a recovery cap to push through; well over → let the plateau end naturally.
 
 4. **Anti-pattern to avoid: stale-percentage-based early termination.** Per-scroll tracing on For You shows `stale%` oscillates wildly between 30% and 100% even while fresh content is still being surfaced — the algorithm interleaves pockets of old and new. A "3 consecutive scrolls > N% stale" rule fires on the stale pockets and misses the fresh ones right after.
 
@@ -168,9 +154,10 @@ The only mutating actions allowed in step 3. Apply in whatever order the observe
   - Drop every tweet where `isPromoted === true`.
   - Drop entries with no `timeISO` — they're typically promoted/structurally-anomalous.
   - Drop every tweet whose `statusUrl` is in `state/digested-urls.json` — already summarized in a prior run.
-- **Soft filter at triage time**: marketing / influencer-shill content (see `references/themes.md` → "Triage rules"). Also downweight obviously stale content — if a tweet's relative timestamp is "3d" or older AND the substance is time-sensitive (e.g. a "BREAKING:" tweet from days ago, a sports score), drop it. Evergreen content (essays, opinions, references) at any age is fine if it survived URL dedup.
+- **Soft filter at triage time**: marketing / influencer-shill content (see `references/themes.md` → "Triage rules"). Also downweight obviously stale content — if a tweet's relative timestamp is "3d" or older AND the substance is time-sensitive (e.g. a "BREAKING:" tweet from days ago, a sports score), drop it. Evergreen content (essays, opinions, references) at any age is fine if it survived URL dedup. Record soft-filter decisions in the candidate audit rather than silently discarding them.
+- **Audit filter decisions**: hard-filtered items should not enter scoring or Telegram composition, but they should appear in the candidate audit when they have a stable enough `statusUrl` / author / text to make the reason useful. Use `selectedForDraft:false`, `shipped:false`, `section:null`, and `rejectionReason:"promoted"`, `"already_digested"`, `"no_status_url"`, or the matching reason code.
 
-**Note on URL dedup vs. triage**: only *summarized* URLs (the bullets that actually shipped) get added to `digested-urls.json`, NOT every URL we scrolled past. So a tweet that was scraped but dropped in triage one run can be re-evaluated cleanly the next run if the algo re-surfaces it — borderline content gets a second chance to make the cut.
+**Note on URL dedup vs. triage**: only *shipped* URLs (the bullets that actually reached Telegram) get added to `digested-urls.json`, NOT every URL we scrolled past. So a tweet that was scraped but dropped in triage one run can be re-evaluated cleanly the next run if the algo re-surfaces it — borderline content gets a second chance to make the cut. The candidate audit records the previous rejection, but it is not a dedup source.
 
 #### Selector reference
 
@@ -232,9 +219,56 @@ Sanity check: if `bodyLen < 500` and the URL still resolves to the article, the 
 
 Otherwise summarize each article in 2-3 sentences. Capture `{ title, author, url, summary }`.
 
-### 5. Theme and compose
+### 5. Score, audit, dynamically classify, and compose
 
-Read `references/themes.md` and apply triage rules. Compose HTML (NOT Markdown — Telegram's legacy Markdown breaks on `_*[` in tweet text; HTML mode is more predictable):
+Read `references/themes.md` and apply the scoring + triage rules. Do this in four passes:
+
+1. **Score every candidate before assigning a section.** For each unique tweet that survived hard extraction filters, produce integer 0-5 scores for `importance`, `novelty`, `personal_relevance`, `substance`, and `delight`. Also produce `scores.total`, `candidateLabels` (at least one rough label such as `AI`, `NYC`, `science`, `startup_markets`, unless the rejection is exactly `low_substance` or `off_topic`), and a short `scoreReason`. Labels must be meaningful enough to explain what the post was about; do not use `random`, `misc`, or `other` as the only label. `scoreReason` must explain the concrete reason for the score/rejection; do not use placeholders like `auto-labeled; not selected`. For hard-filtered rows, skip scoring and record the rejection reason.
+2. **Select the strongest posts independent of section shape.** Pick the posts that are actually useful or interesting; do not drop a strong post just because it does not fit AI / Startups / NYC / Random. Use rejection reason codes from `references/themes.md` for everything plausible but not selected.
+3. **Run a rescue pass before finalizing the draft.** Re-check rejected posts for personal utility, AI tooling/coding-agent relevance, high-signal accounts, science/health follow-ups, and anything stronger than the weakest selected item. Rescue useful oddballs into a small `Worth a skim` / `Useful odds & ends` section instead of forcing them into an old anchor.
+4. **Write the candidate audit before composing Telegram.** The audit is durable even if the Telegram send later fails, so the operator can inspect what was seen and why items were selected or rejected.
+5. **Derive dynamic sections from the selected posts.** Name sections after the actual clusters in this run. The old anchors can appear when they fit, but do not force them. Use 2-5 tweet sections, plus `📰 Long-form articles` when articles qualify.
+
+Do not build the audit with a generic fallback pass that assigns `candidateLabels:["random"]` or `scoreReason:"auto-labeled; not selected"` to the long tail. If the candidate set is large, use concise but specific labels and reasons in batches: for example `culture` + `weak_personal_fit`, `sports` + `off_topic`, `markets` + `duplicate_topic`, `AI`/`coding_agents` + `lower_score_than_cluster`, `health` + `telegram_budget`. The audit is useful only if a rejected row is understandable without re-reading the original tweet.
+
+Candidate audit shape: top-level `runAt`, `dryRun`, `scrolledFor`, `rawTileCount`, `auditedTileCount`, `candidateCount`, `selectedForDraftCount`, `shippedCount`, `sectionNames`, `shippedUrls`, and `candidates[]`. Each candidate should include `statusUrl`, `author`, `timeISO`, `text`, `articleLink`, `hardFiltered`, `scores` (`importance`, `novelty`, `personal_relevance`, `substance`, `delight`, `total`), `candidateLabels`, `selectedForDraft`, `shipped`, `section`, `rejectionReason`, `cutReason`, and `scoreReason`.
+
+Field semantics:
+
+- `selectedForDraft:true` means the post survived triage and was intended for the digest before Telegram length / final composition cuts.
+- `shipped:true` means the post actually appears in the Telegram message. Only these URLs belong in `shippedUrls` and `SUMMARIZED_URLS_JSON`.
+- `cutReason` is required when `selectedForDraft:true` but `shipped:false` (`telegram_budget`, `article_budget`, `duplicate_topic`, etc.).
+- `rejectionReason` is for candidates never selected for the draft; leave it null for shipped posts. Use `lower_score_than_cluster` only when the candidate shares a meaningful label with a selected post and lost to stronger coverage in that same cluster. Otherwise use a specific reason such as `weak_personal_fit`, `weak_utility`, `duplicate_topic`, `off_topic`, `stale_time_sensitive`, or `telegram_budget`.
+
+Write it with an atomic temp-file replacement and prune to the last 30 audits:
+
+```bash
+AUDITS_DIR=~/.claude/skills/twitter-digest/state/candidate-audits
+mkdir -p "$AUDITS_DIR"
+RUN_AT=$(python3 -c "from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())")
+AUDIT_PATH="$AUDITS_DIR/$(printf '%s' "$RUN_AT" | tr ':+' '--').json"
+
+# Compose $CANDIDATE_AUDIT_JSON as valid JSON matching the schema above. If the
+# JSON is large, prefer writing it from Python with json.dump instead of passing
+# it through additional shell commands.
+printf '%s' "$CANDIDATE_AUDIT_JSON" > "$AUDIT_PATH.tmp"
+python3 -m json.tool "$AUDIT_PATH.tmp" > "$AUDIT_PATH.pretty"
+mv "$AUDIT_PATH.pretty" "$AUDIT_PATH"
+rm -f "$AUDIT_PATH.tmp"
+
+ls -t "$AUDITS_DIR"/*.json 2>/dev/null | tail -n +31 | xargs -I {} rm -f {}
+```
+
+After writing the audit, run the QA helper and log its output:
+
+```bash
+/Users/pattybot/dotfiles/twitter/bin/lib/validate-candidate-audit.py "$AUDIT_PATH"
+AUDIT_QA_EXIT=$?
+```
+
+Exit non-zero if `AUDIT_QA_EXIT` is non-zero; that means the audit is structurally misleading (for example `shippedUrls` doesn't match `shipped:true` rows). Warnings are allowed to ship but should appear in the run log; they flag quality risks such as blank labels, collapsed scoring, high-personal-relevance rejects or cuts, selected/delivered divergence, and `lower_score_than_cluster` used outside a selected cluster.
+
+Compose HTML (NOT Markdown — Telegram's legacy Markdown breaks on `_*[` in tweet text; HTML mode is more predictable):
 
 Pick the header based on local clock hour at compose time:
 - `4 ≤ hour < 16` (morning fires, primarily 08:00 run): `🌅 <b>Morning digest — <date></b>`
@@ -245,17 +279,11 @@ Everything below the header is the same regardless of which fire ran.
 ```
 <🌅 Morning digest | 🌆 Evening recap> — <date>
 
-🤖 <b>AI</b>
+<dynamic emoji> <b><dynamic section name></b>
 • <a href="<statusUrl>">@author tweeted</a>: <one-line summary>
 • <a href="<statusUrl>">@author posted</a>: <one-line summary>
 
-💼 <b>Startups &amp; VC</b>
-• …
-
-🗽 <b>NYC</b>
-• …
-
-✨ <b>Random Interesting</b>
+<dynamic emoji> <b><dynamic section name></b>
 • …
 
 📰 <b>Long-form articles</b>
@@ -278,7 +306,16 @@ Telegram HTML supports a small whitelist: `<b>`, `<i>`, `<u>`, `<s>`, `<a href="
 
 **Framing note**: always attribute — "@author tweeted..." / "@author posted..." / "per @account" — rather than first-person fact claims. Tweets are positions; the digest is a pointer to what they said. The italic disclaimer at the bottom of the digest reinforces this and avoids content-integrity blocks on the `claude -p` side.
 
-If a theme has zero items, omit the section entirely. If literally no overnight content qualifies, send a single line `Nothing notable on X 🥱` instead of a multi-section empty digest.
+If a dynamic section has zero items, omit it entirely. If literally no overnight content qualifies, send a single line `Nothing notable on X 🥱` instead of a multi-section empty digest.
+
+After composing, write the candidate-linked tweet bullets to `$RUN_DIR/digest.html` / `$RUN_DIR/digest.txt` and run the digest-output verifier before Telegram (or before printing in dry-run):
+
+```bash
+/Users/pattybot/dotfiles/twitter/bin/lib/validate-digest-output.py "$AUDIT_PATH" "$RUN_DIR/digest.html"
+DIGEST_QA_EXIT=$?
+```
+
+Exit non-zero if `DIGEST_QA_EXIT` is non-zero. This catches stale hard-coded summary maps, `<missing summary>` placeholders, and cases where the actual composed tweet bullets diverge from `shippedUrls` / `shippedCount`. Do not send Telegram, append dedup, or advance state if this verifier fails.
 
 ### 6. Pre-send: write pending state
 
@@ -288,7 +325,7 @@ Before calling Telegram, write `state/pending.json` so a crash mid-send leaves a
 PENDING=~/.claude/skills/twitter-digest/state/pending.json
 NOW=$(python3 -c "from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())")
 cat > "$PENDING" <<EOF
-{"runAt": "$NOW", "scrolledFor": $SCROLL_SECONDS, "tweetCount": $TWEET_COUNT, "articleCount": $ARTICLE_COUNT, "telegramOk": null}
+{"runAt": "$NOW", "scrolledFor": $SCROLL_SECONDS, "tweetCount": $TWEET_COUNT, "articleCount": $ARTICLE_COUNT, "auditPath": "$AUDIT_PATH", "shippedUrls": $SUMMARIZED_URLS_JSON, "telegramOk": null}
 EOF
 ```
 
@@ -337,7 +374,7 @@ LAST_SUCCESS=~/.claude/skills/twitter-digest/state/last-success.json
 DIGESTED_URLS=~/.claude/skills/twitter-digest/state/digested-urls.json
 
 # Step 8a: persist dedup FIRST.
-# $SUMMARIZED_URLS_JSON is the JSON array of statusUrls that actually shipped.
+# $SUMMARIZED_URLS_JSON is the JSON array of statusUrls whose audit rows have shipped:true.
 DEDUP_FILE="$DIGESTED_URLS" \
 DEDUP_URLS_JSON="$SUMMARIZED_URLS_JSON" \
 DEDUP_TTL_DAYS=7 \
@@ -369,7 +406,7 @@ Note: there's no time cutoff for the next run. `last-success.json` is kept only 
 
 ## Dry-run mode
 
-If invoked with "dry-run" or "--dry-run" in the prompt, do everything *except* steps 6-8 — print the composed digest HTML to stdout, skip pending.json, skip Telegram, skip last-success update. Useful for iterating on themes/format without spamming the chat.
+If invoked with "dry-run" or "--dry-run" in the prompt, still run extraction, scoring, dynamic classification, and candidate-audit writing with `"dryRun": true`. Then print the composed digest HTML to stdout and skip pending.json, Telegram, URL dedup, and last-success update. Useful for iterating on selection/format without spamming the chat.
 
 Do NOT call `browser-use close --all` even in dry-run — the daemon Chrome stays up always.
 

@@ -1,6 +1,6 @@
 ---
 name: credit-card-offers
-description: Activate available Chase Offers and Amex Offers on a daily fire. Attaches via CDP to a long-running cards-bot Chrome daemon (launchctl-managed, persistent profile, debug port 19223), agentically inspects the offers pages, clicks the activate button on every unactivated offer, deduplicates against per-issuer state files, and delivers a Telegram summary. Fires once daily at 03:00 PT via launchd. Use when the user asks for "activate my credit card offers", "Chase offers", "Amex offers", "card offer roundup", or when fired by launchd.
+description: Activate available Chase Offers and Amex Offers on a daily fire. Attaches via CDP to a long-running cards-bot Chrome daemon (launchctl-managed, persistent profile, debug port 19223), agentically inspects the offers pages, clicks the activate button on every unactivated offer, deduplicates against per-issuer state files, and delivers a Telegram summary. Fires once daily at 15:00 local time via launchd. Use when the user asks for "activate my credit card offers", "Chase offers", "Amex offers", "card offer roundup", or when fired by launchd.
 ---
 
 # Credit Card Offers
@@ -9,7 +9,7 @@ Once-daily job: attach to the persistent cards-bot Chrome on `127.0.0.1:19223`, 
 
 **Key design principle:** this skill is *agentic*, not scripted. You inspect the page at runtime, identify offers, click them, and verify the outcome — using JavaScript expressions you write yourself and send via the `cdp-eval.sh` primitive. The bank UI changes frequently; do NOT bake selectors into helper scripts. Adapt to what you see. When this SKILL.md gives example selectors below, those are *current observations as of 2026-05-14* — not contracts. If a selector returns 0 elements, probe to find the new one rather than failing.
 
-The fire is daily-not-bidaily and at 03:00 PT specifically because banks pattern-match high-frequency identical sessions; off-peak + low-cadence keeps the access profile boring.
+The fire is daily-not-bidaily and at 15:00 local time specifically because banks pattern-match high-frequency identical sessions; low cadence plus operator availability keeps the access profile boring and makes re-auth practical.
 
 ## Primitives available to you
 
@@ -152,6 +152,8 @@ Stop conditions: hit `AMEX_MAX_CLICKS`, ran out of buttons, OR encountered a ver
 
 Chase is a 2-step flow (hub → detail → Add → back). And critically: Chase aggressively logs you out of the offers area. `/dashboard/overview` being logged in doesn't mean `/offers/offerHub` is — Chase requires step-up auth for offers specifically.
 
+Do not navigate directly to `#/dashboard/offers/offerHub`. Observed 2026-05-14: a signed-in session can render a blank Chase shell with only `Sign out` at that URL. The reliable route is dashboard first, then the dashboard's `See your offers` CTA, which resolves to `#/dashboard/merchantOffers/offer-hub?accountId=...`.
+
 **Step 3.1 — Pre-flight:**
 
 ```bash
@@ -167,24 +169,41 @@ EXPRESSION='JSON.stringify({
 
 If `hasPwInput=true`, `title` matches `/sign in/i`, or `bodyLen < 200` while title indicates login: auth wall. Screenshot + `kind:"auth"` + skip Chase.
 
-Otherwise navigate to the offers hub:
+Otherwise navigate to the logged-in dashboard first:
 ```bash
 TARGET_URL_SUBSTRING=chase.com \
-EXPRESSION='location.href = "https://secure.chase.com/web/auth/dashboard#/dashboard/offers/offerHub"; "navigating"' \
+EXPRESSION='location.href = "https://secure.chase.com/web/auth/dashboard"; "navigating"' \
 /Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh
-sleep 8  # Chase SPA hash-routing resolves to /merchantOffers/offer-hub; slow.
+sleep 8
 ```
 
-Re-probe. Expected end state: URL contains `offer-hub`, `bodyLen > 500`, and at least one element matching `[data-testid*="offerHub-tile" i]` exists.
+Then click the dashboard CTA into the offers hub:
+```bash
+TARGET_URL_SUBSTRING=chase.com \
+EXPRESSION='(() => {
+  const cta = Array.from(document.querySelectorAll("button, a, [role=button], [role=link]"))
+    .find(el => /see your offers|see all offers/i.test((el.innerText || el.getAttribute("aria-label") || "").trim()));
+  if (!cta) return "no-offers-cta";
+  cta.scrollIntoView({block:"center"});
+  cta.click();
+  return "clicked";
+})()' \
+/Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh
+sleep 8
+```
+
+Re-probe. Expected end state: URL contains `merchantOffers/offer-hub`, `bodyLen > 500`, and at least one element matching `[data-testid="commerce-tile"]` exists. If the dashboard is signed in but the CTA is missing, screenshot + `kind:"dom"` + skip Chase.
 
 **Step 3.2 — Click loop.** Up to `CHASE_MAX_CLICKS` (default 25):
 
 a. **Enumerate hub tiles**:
 ```bash
 TARGET_URL_SUBSTRING=chase.com \
-EXPRESSION='JSON.stringify(Array.from(document.querySelectorAll("[data-testid*=offerHub-tile]")).map((t, i) => ({
+EXPRESSION='JSON.stringify(Array.from(document.querySelectorAll("[data-testid=commerce-tile]")).map((t, i) => ({
   index: i,
+  id: t.id || "",
   testid: t.getAttribute("data-testid"),
+  aria: t.getAttribute("aria-label") || "",
   text: (t.innerText || "").trim().slice(0, 200),
 })))' \
 /Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh
@@ -196,7 +215,7 @@ b. **Click the first tile**, which navigates to the detail page:
 ```bash
 TARGET_URL_SUBSTRING=chase.com \
 EXPRESSION='(() => {
-  const tile = document.querySelector("[data-testid*=offerHub-tile]");
+  const tile = document.querySelector("[data-testid=commerce-tile]");
   if (!tile) return "no-tile";
   tile.scrollIntoView({block:"center"});
   tile.click();
@@ -254,10 +273,10 @@ EXPRESSION='!!document.querySelector("[data-testid=added-to-card-alert]")' \
 
 If `value=true`: record `{merchant, deal: offerAmount, offer_id: <from url>}` to your chase activated list. If `false`: screenshot, record failure, bail Chase.
 
-g. **Navigate back to hub** (direct URL — don't trust history.back on Chase's hash router):
+g. **Navigate back to hub**. Prefer the exact `merchantOffers/offer-hub?...accountId=...` URL captured from the successful hub page; if you do not have that URL, return to dashboard and click `See your offers` again. Do not use the old `#/dashboard/offers/offerHub` URL.
 ```bash
 TARGET_URL_SUBSTRING=chase.com \
-EXPRESSION='location.href = "https://secure.chase.com/web/auth/dashboard#/dashboard/offers/offerHub"; "navigating"' \
+EXPRESSION='location.href = "<captured merchantOffers hub URL>"; "navigating"' \
 /Users/pattybot/dotfiles/cards/bin/lib/cdp-eval.sh
 sleep 5
 ```
@@ -391,7 +410,7 @@ Restating the hard rules and adding observed-mistake patterns:
 - **Do not type into any input field.**
 - **Do not click anything outside activate-offer buttons** (Amex) or **offer tiles / Add buttons on detail pages** (Chase). No modal-dismiss clicks. No "Continue" / "Got it" / "Skip".
 - **Do not retry a failed click.** One click, one verify, move on.
-- **Do not run more often than daily.** The plist is 03:00 PT daily for a reason.
+- **Do not run more often than daily.** The plist is 15:00 local time daily for a reason.
 - **Do not fake foreground state via `Page.setWebLifecycleState`.** `Page.bringToFront` is allowed and `cdp-eval.sh` already calls it.
 - **Do not advance `last-success.json` on Telegram failure.**
 - **Do not send a Telegram error message when Telegram itself is the failure.**

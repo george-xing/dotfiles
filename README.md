@@ -16,6 +16,7 @@ stow -t ~ -R twitter-digest    # reinstall (idempotent refresh after layout chan
 ## Packages
 
 - **`twitter-digest/`** — Morning (08:00 ET) and evening (22:00 ET) X/Twitter digest delivered to Telegram via a Claude Code skill + `browser-use` CLI + launchd. Requires: `browser-use` CLI + the Claude Code `browser-use` skill at `~/.claude/skills/browser-use/`, logged-in X cookies at `~/.claude/skills/twitter-digest/state/x-cookies.json` (not committed — export via `browser-use cookies export` after a manual `--headed` login), and a Telegram bot token at `~/.claude/channels/telegram/.env`. Operational runbook lives inside the package at `.claude/skills/twitter-digest/references/runbook.md`.
+- **`whatsapp-digest/`** — Standalone WhatsApp digest MCP spike. Provides a read-only `whatsapp-digest-mcp` stdio server backed by `whatsapp-web.js`, plus a Claude Code skill shell for daily Telegram digests. Requires QR login via WhatsApp Linked Devices and dependency install under `~/.local/share/whatsapp-digest`. Operational runbook lives at `.claude/skills/whatsapp-digest/references/runbook.md`.
 
 ## Not in the repo
 

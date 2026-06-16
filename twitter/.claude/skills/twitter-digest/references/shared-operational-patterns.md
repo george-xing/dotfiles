@@ -53,6 +53,6 @@ Exit handling:
 
 ## State Finalize
 
-On success, append summarized URLs to the dedup file before advancing `last-success.json`. If URL persistence fails after Telegram succeeded, write `kind: "dedup"`, leave `pending.json` in place for forensics, and do not advance `last-success.json`.
+On success, append only URLs whose audit rows have `shipped:true` to the dedup file before advancing `last-success.json`. If URL persistence fails after Telegram succeeded, write `kind: "dedup"`, leave `pending.json` in place for forensics, and do not advance `last-success.json`.
 
 Only after dedup succeeds should the skill atomically move `pending.json` into `last-success.json` and remove `pending.json`.

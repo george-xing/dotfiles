@@ -10,7 +10,6 @@ A single GNU Stow package (`twitter/`) inside `~/dotfiles`. Running `stow -t ~ -
 |---|---|
 | `bin/twitter-fire.sh` | `~/bin/twitter-fire.sh` |
 | `bin/twitter-prefire.sh` | `~/bin/twitter-prefire.sh` |
-| `bin/twitter-digest-fire.legacy.sh` | `~/bin/twitter-digest-fire.legacy.sh` (rollback only) |
 | `bin/twitter-bot-chrome-setup.sh` | `~/bin/twitter-bot-chrome-setup.sh` |
 | `Library/LaunchAgents/com.pattybot.twitter-bot-chrome.plist` | `~/Library/LaunchAgents/com.pattybot.twitter-bot-chrome.plist` |
 | `Library/LaunchAgents/com.pattybot.twitter-digest.plist` | `~/Library/LaunchAgents/com.pattybot.twitter-digest.plist` |
@@ -29,7 +28,7 @@ Two launchd jobs cooperate. Reading just one in isolation will mislead you.
 
 The fire wrapper is split into two pieces:
 
-- **`bin/twitter-prefire.sh`** — OS plumbing only. Health-checks `http://127.0.0.1:9222/json/version` for up to 12s; disambiguates the bot Chrome from the user's daily Chrome via `lsof -iTCP:9222 -sTCP:LISTEN -t`; CDP-unminimizes bot Chrome windows; pre-warms System Events (eliminates AppleEvent timeout race on cold-launchd starts); activates the bot Chrome PID through System Events with a 30s timeout + diagnostic stderr capture; bounded-polls activation settlement. Emits `SAVED_FRONTMOST_PID=<pid>` as its final stdout line. Does NOT invoke claude or touch Telegram.
+- **`bin/twitter-prefire.sh`** — OS plumbing only. Health-checks `http://127.0.0.1:9222/json/version` for up to 12s; disambiguates the bot Chrome from the user's daily Chrome via `lsof -iTCP:9222 -sTCP:LISTEN -t`; **recycles the bot Chrome daemon (`launchctl bootout`+`bootstrap`) when its process uptime exceeds `BOT_CHROME_RECYCLE_AFTER_SECS` (default 3d)** — a long-uptime Chrome accumulates window-occlusion drift and reports `vis:hidden`; CDP-unminimizes bot Chrome windows; pre-warms System Events (eliminates AppleEvent timeout race on cold-launchd starts); activates the bot Chrome PID through System Events with a 30s timeout + diagnostic stderr capture; bounded-polls activation settlement; **reactively recycles once if it still probes `vis:hidden` while under the uptime gate**. Emits `BOT_CHROME_PID=<pid>` (final, post-recycle) and `SAVED_FRONTMOST_PID=<pid>` (last line) as machine-parsed stdout. Does NOT invoke claude or touch Telegram.
 - **`bin/twitter-fire.sh <skill-name>`** — orchestrator. Acquires shared flock at `~/.claude/skills/.twitter-fire.lock` (exits 3 with `kind:busy` on conflict); calls prefire; runs `claude -p` against the named skill's SKILL.md; restores prior frontmost only if bot Chrome is still frontmost at restore time (so a manual app switch during the scrape isn't clobbered). One wrapper, two skills: both `twitter-digest` and `twitter-bookmarks` invoke it as `twitter-fire.sh <name>`.
 
 The skill (`.claude/skills/twitter-digest/SKILL.md`) is the actual work: CDP-attach, scroll `x.com/home` ~3 minutes, theme tweets, summarize any X Articles, send to Telegram. The lookback cutoff is read from `state/last-success.json#runAt` (under `~/.claude/skills/twitter-digest/`, gitignored), capped at 24h, so the morning and evening windows hand off without overlap.

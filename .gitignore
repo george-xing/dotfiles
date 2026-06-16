@@ -13,4 +13,8 @@
 
 # Claude Code per-machine overrides + remember plugin local state
 .claude/settings.local.json
+.claude/worktrees/
 .remember/
+
+# Standalone nested repo.
+whatsapp-digest/

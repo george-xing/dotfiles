@@ -101,6 +101,11 @@ bootout_sibling_chromes() {
 }
 
 restore_sibling_chromes() {
+  # macOS /bin/bash is 3.2, where expanding an empty array as "${arr[@]}"
+  # under `set -u` aborts with "unbound variable". The ${#arr[@]} length
+  # form is safe even when empty (see bootout_sibling_chromes, line ~100),
+  # so gate the loop on it — nothing to restore when no siblings were booted.
+  [ ${#BOOTOUTED_SIBLINGS[@]} -gt 0 ] || return 0
   local label plist uid
   uid=$(id -u)
   for label in "${BOOTOUTED_SIBLINGS[@]}"; do
@@ -175,11 +180,13 @@ trap '{ restore_sibling_chromes; rm -f "$LOCK_FILE"; } >> "$LOG" 2>&1' EXIT INT 
     exit $PREFIRE_EXIT
   fi
 
+  # prefire emits both as machine-parseable `KEY=value` lines; it may recycle the
+  # bot Chrome mid-prefire, so BOT_CHROME_PID is the FINAL (post-recycle) PID.
   SAVED_FRONTMOST_PID=$(echo "$PREFIRE_OUT" | grep '^SAVED_FRONTMOST_PID=' | tail -1 | cut -d= -f2)
-  BOT_CHROME_PID=$(echo "$PREFIRE_OUT" | grep -oE 'activating bot Chrome PID=[0-9]+' | head -1 | cut -d= -f2)
+  BOT_CHROME_PID=$(echo "$PREFIRE_OUT" | grep '^BOT_CHROME_PID=' | tail -1 | cut -d= -f2)
 
   if [[ "$DRY_RUN_FLAG" == "--dry-run" ]]; then
-    PROMPT="Run the ${SKILL_NAME} skill defined in $SKILL_PATH in dry-run mode — execute it as described there but skip the Telegram send and state-file writes."
+    PROMPT="Run the ${SKILL_NAME} skill defined in $SKILL_PATH in dry-run mode — execute it as described there. For twitter-digest, candidate-audit state writes are allowed; otherwise skip Telegram, URL dedup, pending.json, and last-success writes."
   else
     PROMPT="Run the ${SKILL_NAME} skill defined in $SKILL_PATH — execute it as described there."
   fi

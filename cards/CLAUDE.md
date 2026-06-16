@@ -26,8 +26,8 @@ There is no build, lint, or test step. The codebase is bash + macOS launchd plis
 Mirrors the twitter package's two-job pattern, extended to three. Three launchd jobs cooperate:
 
 1. **`com.pattybot.cards-bot-chrome`** — `KeepAlive: true`, runs `Google Chrome.app` with `--user-data-dir=~/Library/Application Support/cards-bot-chrome --remote-debugging-port=19223`. **Always running.** This is the only Chrome the offers skill ever talks to — its persistent profile holds the Chase + Amex session cookies. Coexists with the twitter bot Chrome (9222) and the user's daily Chrome because Chromium's process singleton is keyed on `--user-data-dir`.
-2. **`com.pattybot.credit-card-offers`** — `StartCalendarInterval` at 03:00 local time daily, fires `bin/cards-fire.sh credit-card-offers`. `RunAtLoad=false` so a fresh launchctl-bootstrap doesn't trigger a mid-day fire against bank sites — only the next 03:00.
-3. **`com.pattybot.cards-keepalive`** — `StartInterval: 300` (every 5 min), `RunAtLoad: true`. Fires `bin/cards-keepalive.sh`. Pokes the daemon Chrome's Amex/Chase tabs with `Page.bringToFront` + 1–3 px scroll to reset bank-side idle timers, and observes session state. Telegrams the operator on auth-wall transitions (per-issuer 6h cooldown). See `docs/superpowers/specs/2026-05-13-cards-session-keepalive-design.md`.
+2. **`com.pattybot.credit-card-offers`** — `StartCalendarInterval` at 15:00 local time daily, fires `bin/cards-fire.sh credit-card-offers`. `RunAtLoad=false` so a fresh launchctl-bootstrap doesn't trigger a mid-day fire against bank sites — only the next 15:00.
+3. **`com.pattybot.cards-keepalive`** — `StartInterval: 300` (every 5 min), `RunAtLoad: true`. Fires `bin/cards-keepalive.sh`. Pokes the daemon Chrome's Amex/Chase tabs with `Page.bringToFront` + 1–3 px scroll, reloads the current page, then sends a same-origin credentialed `fetch(location.href)` heartbeat to reset bank-side idle timers, and observes session state. Telegrams the operator on auth-wall transitions (per-issuer 6h cooldown). See `docs/superpowers/specs/2026-05-13-cards-session-keepalive-design.md`.
 
 The fire wrapper is split into two pieces, structurally identical to twitter:
 
@@ -36,7 +36,7 @@ The fire wrapper is split into two pieces, structurally identical to twitter:
 
 The keepalive wrapper is a separate one-shot:
 
-- **`bin/cards-keepalive.sh`** — one iteration per launchd invocation. Reads `state/fire-in-progress.lock` and skips if a fire is active (PID-alive check first via `kill -0`; 60-min `mtime` cap as a tertiary fallback against PID reuse). Otherwise: discover tracked tabs via CDP, per-tab `Page.bringToFront` + 1–3 px scroll + counter-scroll + probe, diff against `state/keepalive-events.jsonl` tail, append event on state change, Telegram on notifiable transitions (subject to per-issuer 6h cooldown). Does not log in, type, click, retry, navigate, or open/close tabs. See spec for full taxonomy.
+- **`bin/cards-keepalive.sh`** — one iteration per launchd invocation. Reads `state/fire-in-progress.lock` and skips if a fire is active (PID-alive check first via `kill -0`; stale live locks are logged and deferred rather than raced). Otherwise: discover tracked tabs via CDP, per-tab `Page.bringToFront` + 1–3 px scroll + counter-scroll + current-page reload + same-origin credentialed heartbeat fetch + probe, diff against `state/keepalive-events.jsonl` tail, append event on state change, Telegram on notifiable transitions (subject to per-issuer 6h cooldown). Does not log in, type, click, retry, navigate, or open/close tabs. See spec for full taxonomy.
 
 The skill (`.claude/skills/credit-card-offers/SKILL.md`) is the actual work: CDP-attach, navigate to Chase Offers hub + Amex Offers, click "Add to card" on every unactivated offer, dedup against `state/{chase,amex}-activated.json`, deliver summary to Telegram.
 
@@ -92,7 +92,7 @@ tail -50 ~/Library/Logs/cards-fire.log
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.credit-card-offers.plist
 launchctl bootout   gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.credit-card-offers.plist
 
-# Trigger via launchd (same code path as the 03:00 local fire)
+# Trigger via launchd (same code path as the 15:00 local fire)
 launchctl kickstart -p gui/$(id -u)/com.pattybot.credit-card-offers
 
 # Daemon Chrome control (NEVER use Cmd-Q or `osascript ... quit` — those

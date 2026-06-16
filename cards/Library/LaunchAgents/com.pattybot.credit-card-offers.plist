@@ -12,13 +12,13 @@
     </array>
 
     <!--
-        Single fire per day at 03:00 local time (rationale below):
+        Single fire per day at 15:00 local time (rationale below):
 
         - Banks pattern-match high-frequency identical sessions. Daily is
           slow enough to keep the access profile boring.
-        - 03:00 is off-peak for both Chase and Amex backend systems AND
-          unlikely to compete with the user's daily Chrome on the Mac mini.
-        - Picked local rather than UTC so the fire stays at 03:00 even
+        - 15:00 is during normal operator availability for re-auth help
+          while still running just once per day.
+        - Picked local rather than UTC so the fire stays at 15:00 even
           across DST transitions — launchd interprets StartCalendarInterval
           in the system's local timezone.
 
@@ -29,7 +29,7 @@
     <array>
         <dict>
             <key>Hour</key>
-            <integer>3</integer>
+            <integer>15</integer>
             <key>Minute</key>
             <integer>0</integer>
         </dict>
@@ -43,7 +43,7 @@
 
     <!--
         RunAtLoad=false is deliberate. The first fire happens on the next
-        scheduled 03:00 — not when the plist is loaded. Otherwise an
+        scheduled 15:00 — not when the plist is loaded. Otherwise an
         accidental launchctl bootstrap mid-day would immediately fire
         the skill against bank sites during business hours.
     -->

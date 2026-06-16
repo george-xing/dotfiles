@@ -456,3 +456,19 @@ Task 9's live one-shot run already exercised the auth-wall and vis-error code pa
 ### Recommendation
 
 Proceed to Task 15 (merge + stow + bootstrap + Rung 6) given Rungs 1/3/4/partial-5 are green. Operator should accept that the skipped rungs (Rung 2 about:blank, Rung 5 daemon-down/tab-missing/auth-wall/dom-error) will be validated either via live operation post-bootstrap or by running them manually after VNC.
+
+## 15. Issue #1 correction (2026-05-14)
+
+The original v1 keepalive design assumed `Page.bringToFront` plus a tiny DOM scroll would reset issuer idle timers. Live evidence showed that assumption was wrong: DOM-only activity produced no bank HTTP traffic, and Amex/Chase sessions still expired before the next daily fire.
+
+The implementation now performs a current-page reload followed by a same-origin credentialed `fetch(location.href, {cache: "no-store"})` from inside each tracked bank tab after the foreground/scroll poke and before the state probe. This keeps the endpoint generic and issuer-owned instead of hardcoding private bank heartbeat URLs, while still creating authenticated server-side activity that can reset idle timers.
+
+Verification note: the first Issue #1 patch used only `fetch(location.href)`. During a 2026-05-14 assisted verification, Amex still expired at `2026-05-14T17:07:50Z`, about 16 minutes after relogin, despite successful heartbeat fetches. The current-page reload was added after that failed verification.
+
+With the heartbeat in place, `document.visibilityState === "hidden"` is no longer treated as a keepalive failure by itself. The state probe now classifies a tab as authed when there is no password input and the heartbeat did not fail, even if Chrome is backgrounded.
+
+Two adjacent fixes also landed:
+
+- `com.pattybot.credit-card-offers` now fires at 15:00 local time, not 03:00.
+- A live `fire-in-progress.lock` PID is always deferred, even when the lock is older than the stale cap. Old live locks are logged as `stale-lock defer` for investigation; keepalive no longer races a potentially active cards fire.
+- Chase is parked on the stable dashboard URL, and the skill enters offers by clicking the dashboard `See your offers` CTA. Direct `#/dashboard/offers/offerHub` navigation can render a signed-in but blank Chase shell.

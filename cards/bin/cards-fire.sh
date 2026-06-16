@@ -22,7 +22,7 @@
 #
 # Note on lock scope: this lock is package-local (.cards-fire.lock), NOT
 # shared with twitter-fire. Cards and twitter schedules don't overlap
-# (cards 03:00 PT, twitter 08:00 + 22:00 local) — and bank automation
+# (cards 15:00 local, twitter 08:00 + 22:00 local) — and bank automation
 # should never race with anything else for foreground in the first place.
 
 set -uo pipefail
@@ -184,7 +184,7 @@ except Exception as e:
     print(f"park_offers_tabs: cannot list tabs: {e}", file=sys.stderr); sys.exit(0)
 targets = [
     ("americanexpress.com", "https://global.americanexpress.com/offers/eligible"),
-    ("chase.com",           "https://secure.chase.com/web/auth/dashboard#/dashboard/offers/offerHub"),
+    ("chase.com",           "https://secure.chase.com/web/auth/dashboard"),
 ]
 for needle, url in targets:
     tab = next((t for t in tabs if t.get("type") == "page" and needle in (t.get("url") or "")), None)

@@ -106,7 +106,7 @@ State (gitignored, on disk only):
 
 ## Session-died recovery (keepalive Telegram path)
 
-When you receive a Telegram from `cards-keepalive` saying "State: authed → auth-wall" (or "→ tab-missing", "→ daemon-down"), the bot Chrome's session for that issuer has died and the next 03:00 fire will hit a login wall. Recovery:
+When you receive a Telegram from `cards-keepalive` saying "State: authed → auth-wall" (or "→ tab-missing", "→ daemon-down"), the bot Chrome's session for that issuer has died and the next 15:00 fire will hit a login wall. Recovery:
 
 ### auth-wall
 
@@ -114,13 +114,15 @@ When you receive a Telegram from `cards-keepalive` saying "State: authed → aut
 2. Open the cards-bot Chrome window (port 19223; if you have multiple Chromes running, the cards one is the one with the Amex/Chase tabs).
 3. Sign back in on the affected issuer (or both). Complete any MFA challenge presented.
 4. **Do nothing else.** Don't navigate, don't close tabs, don't open new ones.
-5. The next keepalive iteration (within 5 minutes) will probe and record a `auth-wall → authed` event in `keepalive-events.jsonl`. **No code action needed.** The next 03:00 fire will succeed.
+5. The next keepalive iteration (within 5 minutes) will probe and record a `auth-wall → authed` event in `keepalive-events.jsonl`. **No code action needed.** The next 15:00 fire will succeed.
 
 ### tab-missing
 
 Same recovery as auth-wall, plus: open a new tab to the issuer's offers URL:
 - Amex: `https://global.americanexpress.com/offers/eligible`
-- Chase: `https://secure.chase.com/web/auth/dashboard#/dashboard/offers/offerHub`
+- Chase: `https://secure.chase.com/web/auth/dashboard`
+
+For Chase, do not park the tab on `#/dashboard/offers/offerHub`; a signed-in session can render a blank shell there. The skill enters offers from the loaded dashboard through the `See your offers` CTA.
 
 ### daemon-down
 

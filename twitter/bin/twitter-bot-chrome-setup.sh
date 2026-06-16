@@ -88,8 +88,8 @@ cat <<EOF
    active state) if the window is backgrounded.
 
 5. Sanity-check end-to-end:
-     ~/bin/twitter-digest-fire.sh --dry-run
-     tail -50 ~/Library/Logs/twitter-digest.log
+     ~/bin/twitter-fire.sh twitter-digest --dry-run
+     tail -50 ~/Library/Logs/twitter-fire.log
 
    You should see a composed digest in the log without "kind: visibility" or
    "kind: auth" failure entries.

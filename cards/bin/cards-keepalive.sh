@@ -4,7 +4,7 @@
 #
 # One-shot per launchd invocation. No internal loop. Does not log in, does not
 # type, does not click, does not retry. Read-only CDP plus bringToFront +
-# small scroll per iteration.
+# small scroll plus page reload and same-origin HTTP heartbeat per iteration.
 
 set -uo pipefail
 
@@ -64,7 +64,7 @@ PY
 # state_diff_is_notifiable PREV NEW → "yes" | "no"
 # Notifiable kinds: auth-wall, tab-missing, daemon-down — but only when the
 # transition is INTO that kind (not staying there). Recovery (→authed) and
-# informational kinds (vis-error, dom-error) are silent.
+# informational kinds (dom-error, legacy vis-error) are silent.
 state_diff_is_notifiable() {
   local prev="$1" new="$2"
   if [[ "$prev" == "$new" ]]; then
@@ -128,8 +128,9 @@ PY
 }
 
 # probe_tab WS_URL → prints JSON {"vis":..,"hasPwInput":..,"url":..,"err":..}
-# Runs Page.bringToFront, a tiny randomized scroll, counter-scroll, and a
-# probe_js. Returns "err" non-empty if the websocket failed or eval threw.
+# Runs Page.bringToFront, a tiny randomized scroll, counter-scroll, a page
+# reload, a same-origin credentialed fetch of the current page, and a probe_js.
+# Returns "err" non-empty if the websocket failed or eval threw.
 probe_tab() {
   local ws_url="$1"
   "$PYTHON_BIN" - "$ws_url" <<'PY'
@@ -195,11 +196,62 @@ time.sleep(0.25)
 # Step 3: counter-scroll to prevent visual drift over time.
 evaluate("window.scrollBy(0, -2);")
 
-# Step 4: probe.
+# Step 4: reload the current page. Amex did not keep the session alive with a
+# same-origin fetch alone during 2026-05-14 verification; a real page load is
+# heavier but creates the same class of activity as an operator refresh.
+reload_result = cdp("Page.reload", {"ignoreCache": True})
+if "error" in reload_result:
+    print(json.dumps({"err": f"reload: {reload_result['error'].get('message')}"}))
+    ws.close()
+    sys.exit(0)
+time.sleep(4)
+
+# Step 5: generate same-origin server traffic. DOM scrolls only touch local
+# browser state; this fetch is the actual session-idle heartbeat.
+heartbeat_js = """
+(async () => {
+  if (!/^https?:$/.test(location.protocol)) {
+    return {ok: false, skipped: true, reason: "non-http-url", url: location.href};
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort("heartbeat-timeout"), 4000);
+  try {
+    const response = await fetch(location.href, {
+      method: "GET",
+      credentials: "include",
+      cache: "no-store",
+      redirect: "manual",
+      signal: controller.signal
+    });
+    return {
+      ok: true,
+      status: response.status,
+      type: response.type,
+      redirected: response.redirected,
+      url: response.url
+    };
+  } catch (e) {
+    return {ok: false, skipped: false, reason: String(e && (e.message || e.name) || e)};
+  } finally {
+    clearTimeout(timer);
+  }
+})()
+"""
+heartbeat, heartbeat_err = evaluate(heartbeat_js)
+heartbeat_note = ""
+if heartbeat_err:
+    heartbeat_note = f"heartbeat eval: {heartbeat_err.get('message')}"
+elif isinstance(heartbeat, dict) and not heartbeat.get("ok"):
+    heartbeat_note = "heartbeat skipped: " + str(heartbeat.get("reason", "unknown")) if heartbeat.get("skipped") else "heartbeat failed: " + str(heartbeat.get("reason", "unknown"))
+
+# Step 6: probe.
 probe_js = """
 (() => ({
   vis: document.visibilityState,
-  hasPwInput: !!document.querySelector('input[type="password"]'),
+  title: document.title || "",
+  bodyText: (document.body && document.body.innerText || "").slice(0, 2000),
+  hasPwInput: !!document.querySelector('input[type="password"], input[name*="pass" i], input[id*="pass" i]'),
+  hasUserInput: !!document.querySelector('input[name*="user" i], input[id*="user" i], input[autocomplete="username"]'),
   url: location.href
 }))()
 """
@@ -209,12 +261,14 @@ if err:
     print(json.dumps({"err": f"probe eval: {err.get('message')}"}))
     sys.exit(0)
 val["err"] = ""
+val["heartbeat"] = heartbeat if isinstance(heartbeat, dict) else {}
+val["heartbeatErr"] = heartbeat_note
 print(json.dumps(val))
 PY
 }
 
-# probe_tab_to_state PROBE_JSON → emits one of: authed, auth-wall, vis-error, dom-error
-# Precedence: err (non-empty) > hasPwInput (truthy) > vis ≠ "visible" > authed.
+# probe_tab_to_state PROBE_JSON → emits one of: authed, auth-wall, dom-error
+# Precedence: err (non-empty) > auth-wall signals > heartbeat failure > authed.
 # Missing fields are treated as falsy/absent: e.g., no hasPwInput key behaves
 # as hasPwInput=false. Callers must always send a string-encoded JSON object.
 probe_tab_to_state() {
@@ -225,11 +279,25 @@ p = json.loads(sys.argv[1])
 if p.get("err"):
     print("dom-error")
     sys.exit(0)
-if p.get("hasPwInput"):
+title = (p.get("title") or "").lower()
+body = (p.get("bodyText") or "").lower()
+url = (p.get("url") or "").lower()
+authenticated_text = any(s in body for s in [
+    "sign out", "log out", "logout", "added to card", "view all offers", "offer hub",
+])
+auth_wall_text = any(s in title or s in body for s in [
+    "sign in", "log in", "login", "password", "username", "forgot username",
+]) and not authenticated_text
+issuer_login_url = (
+    ("americanexpress.com" in url and "/login" in url) or
+    ("chase.com" in url and ("auth/fcc/login" in url or "signin" in url))
+)
+if p.get("hasPwInput") or p.get("hasUserInput") or auth_wall_text or issuer_login_url:
     print("auth-wall")
     sys.exit(0)
-if p.get("vis") != "visible":
-    print("vis-error")
+heartbeat_err = p.get("heartbeatErr") or ""
+if heartbeat_err.startswith("heartbeat eval:") or heartbeat_err.startswith("heartbeat failed:"):
+    print("dom-error")
     sys.exit(0)
 print("authed")
 PY
@@ -352,6 +420,7 @@ ws_url, out = sys.argv[1], sys.argv[2]
 try:
     ws = websocket.create_connection(ws_url, suppress_origin=True, timeout=5)
     ws.send(json.dumps({"id": 1, "method": "Page.captureScreenshot", "params": {"format": "png"}}))
+    ws.settimeout(5)
     while True:
         r = json.loads(ws.recv())
         if r.get("id") == 1:
@@ -503,19 +572,27 @@ if [[ "${KEEPALIVE_SELFTEST:-0}" == "1" ]]; then
     "yes" "$(lock_is_stale 1700604800 1700000000 3600)"
 
   # probe_tab_to_state(probe_json) → state
-  # Precedence: err > hasPwInput > vis-error > authed.
+  # Precedence: err > auth-wall signals > heartbeat failure > authed.
   assert_eq "probe: authed" \
     "authed" "$(probe_tab_to_state '{"vis":"visible","hasPwInput":false,"url":"x","err":""}')"
   assert_eq "probe: auth-wall (pw input)" \
     "auth-wall" "$(probe_tab_to_state '{"vis":"visible","hasPwInput":true,"url":"x","err":""}')"
-  assert_eq "probe: vis-error (hidden)" \
-    "vis-error" "$(probe_tab_to_state '{"vis":"hidden","hasPwInput":false,"url":"x","err":""}')"
+  assert_eq "probe: auth-wall (sign-in title, empty DOM)" \
+    "auth-wall" "$(probe_tab_to_state '{"vis":"hidden","title":"Sign in - chase.com","bodyText":"","hasPwInput":false,"url":"https://secure.chase.com/web/auth/dashboard#/dashboard/offers/offerHub","err":"","heartbeat":{"ok":true}}')"
+  assert_eq "probe: authed (stale sign-in title but signed-out control present)" \
+    "authed" "$(probe_tab_to_state '{"vis":"hidden","title":"Sign in - chase.com","bodyText":"Skip to main content\nSign out","hasPwInput":false,"url":"https://secure.chase.com/web/auth/dashboard#/dashboard/offers/offerHub","err":"","heartbeat":{"ok":true}}')"
+  assert_eq "probe: auth-wall (login url)" \
+    "auth-wall" "$(probe_tab_to_state '{"vis":"visible","title":"","bodyText":"","hasPwInput":false,"url":"https://www.americanexpress.com/en-US/account/login?DestPage=x","err":"","heartbeat":{"ok":true}}')"
+  assert_eq "probe: authed (hidden but heartbeat ok)" \
+    "authed" "$(probe_tab_to_state '{"vis":"hidden","title":"Offers","bodyText":"Log Out Offers","hasPwInput":false,"url":"x","err":"","heartbeat":{"ok":true}}')"
   assert_eq "probe: dom-error (ws failed)" \
     "dom-error" "$(probe_tab_to_state '{"err":"ws connect: refused"}')"
   assert_eq "probe: err wins over hasPwInput" \
     "dom-error" "$(probe_tab_to_state '{"vis":"visible","hasPwInput":true,"url":"x","err":"eval failed"}')"
-  assert_eq "probe: pw input wins over vis-error" \
+  assert_eq "probe: pw input wins over hidden vis" \
     "auth-wall" "$(probe_tab_to_state '{"vis":"hidden","hasPwInput":true,"url":"x","err":""}')"
+  assert_eq "probe: heartbeat failure is dom-error" \
+    "dom-error" "$(probe_tab_to_state '{"vis":"visible","hasPwInput":false,"url":"x","err":"","heartbeatErr":"heartbeat failed: timeout"}')"
 
   printf "\nselftest: %d/%d passed\n" \
     "$((selftest_total - selftest_failures))" "$selftest_total"
@@ -545,16 +622,14 @@ if [[ -f "$LOCK_FILE" ]]; then
   lock_pid=$(awk '{print $1}' "$LOCK_FILE" 2>/dev/null)
 
   if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
-    # Lock holder PID is alive. Defer unless lock is older than 60-min cap
-    # (which would suggest a coincidental PID reuse of a long-dead fire).
-    if [[ "$(lock_is_stale "$now_epoch" "$lock_mtime" "$STALE_LOCK_SEC")" == "no" ]]; then
-      # Active fire in progress — defer silently.
-      exit 0
+    # Active fire in progress. Even if the lock is old, do not race the fire:
+    # long claude/browser runs are possible, and PID reuse is less harmful than
+    # a keepalive stealing foreground during bank automation.
+    if [[ "$(lock_is_stale "$now_epoch" "$lock_mtime" "$STALE_LOCK_SEC")" == "yes" ]]; then
+      printf "%s stale-lock defer (pid=%s alive, lock-age>%s)\n" \
+        "$(date -u +%FT%TZ)" "$lock_pid" "$STALE_LOCK_SEC" >> "$LOG_FILE"
     fi
-    # PID matches but lock is suspiciously old → likely PID reuse; proceed
-    # with a warning logged so an operator can investigate.
-    printf "%s stale-lock proceed (pid=%s alive but lock-age>%s, PID reuse?)\n" \
-      "$(date -u +%FT%TZ)" "$lock_pid" "$STALE_LOCK_SEC" >> "$LOG_FILE"
+    exit 0
   else
     # Lock-holder PID is dead, missing, or unparseable. Proceed.
     if [[ "$(lock_is_stale "$now_epoch" "$lock_mtime" "$STALE_LOCK_SEC")" == "no" ]]; then
