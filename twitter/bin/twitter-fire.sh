@@ -28,6 +28,7 @@ export LANG="en_US.UTF-8"
 export LC_ALL="en_US.UTF-8"
 
 CLAUDE_BIN="/Users/pattybot/.local/bin/claude"
+CLAUDE_TOKEN_WRAPPER="/Users/pattybot/bin/with-claude-setup-token"
 BROWSER_USE_BIN="/Users/pattybot/.local/bin/browser-use"
 NODE_BIN="/opt/homebrew/bin/node"
 SHLOCK_BIN="/usr/bin/shlock"
@@ -79,7 +80,7 @@ if [ ! -f "$SKILL_PATH" ]; then
 fi
 
 # Sanity: baked-in binaries.
-for bin in "$CLAUDE_BIN" "$BROWSER_USE_BIN" "$NODE_BIN" "$SHLOCK_BIN" "$PYTHON_BIN" "$PREFIRE_BIN"; do
+for bin in "$CLAUDE_BIN" "$CLAUDE_TOKEN_WRAPPER" "$BROWSER_USE_BIN" "$NODE_BIN" "$SHLOCK_BIN" "$PYTHON_BIN" "$PREFIRE_BIN"; do
   if [ ! -x "$bin" ]; then
     echo "ERROR: missing binary $bin — reinstall or update wrapper paths" >&2
     write_failure "config" "missing binary $bin"
@@ -129,7 +130,7 @@ trap 'rm -f "$LOCK_FILE"' EXIT INT TERM
   fi
 
   cd "$HOME"
-  "$CLAUDE_BIN" -p "$PROMPT" --output-format text
+  "$CLAUDE_TOKEN_WRAPPER" "$CLAUDE_BIN" -p "$PROMPT" --output-format text
   STATUS=$?
 
   # Post-fire frontmost restore. Only if:

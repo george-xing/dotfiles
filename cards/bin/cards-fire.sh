@@ -188,7 +188,7 @@ except Exception: print("auth")' 2>/dev/null || echo auth)
   AGENT_OUT=$(mktemp /tmp/cards-agent-output.XXXXXX)
   </dev/null "$SANDBOX_EXEC" -f "$AGENT_SANDBOX" "$CODEX_BIN" exec --ephemeral --skip-git-repo-check \
     -C "/Users/pattybot/dotfiles/cards" \
-    -m gpt-5.4 \
+    -m gpt-5.6-luna -c 'model_reasoning_effort="low"' \
     -s danger-full-access -c 'approval_policy="never"' \
     "$CODEX_PROMPT" 2>&1 | tee "$AGENT_OUT"
   STATUS=${PIPESTATUS[0]}
