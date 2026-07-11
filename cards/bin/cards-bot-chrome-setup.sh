@@ -5,16 +5,14 @@
 #   1. Verify port 19223 isn't already taken (would prevent daemon binding).
 #   2. Create the persistent user-data-dir at the canonical path.
 #   3. Verify the LaunchAgent plist symlink resolves into the dotfiles repo.
-#   4. Print the launchctl bootstrap command + manual sign-in instructions
-#      for Chase and Amex.
+#   4. Print the launchctl bootstrap + 1Password setup instructions.
 #
 # What this deliberately doesn't do:
 #   - Copy cookies from your real Chrome profile. We learned via the twitter
 #     setup that route brings WAL corruption hazards and produces cookies
 #     with weird provenance. Instead, the daemon launches with an empty
-#     profile and you sign into chase.com + americanexpress.com interactively
-#     ONCE in the bot Chrome window. That window stays open under launchd;
-#     cookies accumulate naturally with correct device fingerprint.
+#     profile. The daily job signs in from 1Password and explicitly signs out;
+#     the stable profile preserves the device/browser fingerprint.
 #   - Quit any running Chrome. Doesn't touch the user's daily Chrome at all.
 #     Multiple Chrome.app instances with different --user-data-dirs coexist
 #     fine (Chromium's process singleton is keyed to the data dir). Cards bot
@@ -66,7 +64,7 @@ echo "  ✓ LaunchAgent plist symlink ok: $PLIST -> $RESOLVED"
 
 cat <<EOF
 
-===> Next steps (manual):
+===> Next steps:
 
 1. Load the daemon:
      launchctl bootstrap gui/\$(id -u) "$PLIST"
@@ -76,27 +74,16 @@ cat <<EOF
 
    Expected: a JSON blob with "Browser":"Chrome/<version>".
 
-3. A Chrome window will appear (the cards bot's). Sign in to BOTH banks in
-   this window — cookies persist forever in the bot's user-data-dir at:
+3. A Chrome window will appear (the cards bot's). Its stable device profile is:
      $PERSISTENT_DIR
 
-   a) Navigate to https://secure.chase.com/web/auth/dashboard
-      - Sign in. Complete any MFA challenge.
-      - CHECK "remember this device" if offered.
-      - Confirm you land on the dashboard.
+4. Configure the dedicated read-only 1Password service account and Login-item
+   references (the token is entered through a hidden Keychain prompt):
+     ~/dotfiles/cards/bin/cards-onepassword-setup.sh
 
-   b) Open a new tab → https://global.americanexpress.com/
-      - Sign in. Complete any MFA challenge.
-      - CHECK "remember this device" if offered.
-      - Confirm you land on the account summary.
-
-4. Leave both tabs open. The skill will navigate to the offers pages on
-   each fire; tabs stay logged in for weeks/months. When a session
-   eventually expires, the skill hard-fails with kind:auth — just open
-   this same bot Chrome window and sign back in.
-
-5. Sanity-check the daemon + prefire end-to-end:
+5. Sanity-check the daemon + authentication page detection:
      ~/dotfiles/cards/bin/cards-prefire.sh
+     ~/dotfiles/cards/bin/cards-auth.py login --dry-run
      # Last line should be: SAVED_FRONTMOST_PID=<pid>
 
    The full skill fire (cards-fire.sh credit-card-offers) requires the
@@ -107,8 +94,8 @@ NEVER do these — they were considered and rejected:
   - Don't import cookies from your daily Chrome. Bank cookies frequently
     pin to a device fingerprint that won't transfer cleanly, causing
     immediate re-auth challenges.
-  - Don't try to automate the credential entry. The skill is engineered
-    to NEVER type into any input field on banking sites, ever.
+  - Don't put bank credentials or the 1Password service token in plist files,
+    shell arguments, environment files, or the repository.
   - Don't run this on a different machine. The "trusted device" cookies
     are bound to this Mac mini's network/hardware fingerprint.
 EOF

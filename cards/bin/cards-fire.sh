@@ -11,7 +11,7 @@
 #      Exit 3 (kind:busy) if another cards-fire is currently holding it.
 #   3. Call cards-prefire.sh, capture stdout.
 #   4. Parse SAVED_FRONTMOST_PID and BOT_CHROME_PID from prefire output.
-#   5. Invoke claude -p with the skill prompt (or dry-run variant).
+#   5. Invoke Codex non-interactively to execute the browser-aware skill.
 #   6. Post-fire frontmost restore (only if bot Chrome still frontmost).
 #   7. Release lock; exit with claude's exit code.
 #
@@ -32,9 +32,12 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/Users/pattybot/.local/bin:/Users/
 export LANG="en_US.UTF-8"
 export LC_ALL="en_US.UTF-8"
 
-CLAUDE_BIN="/Users/pattybot/.local/bin/claude"
-BROWSER_USE_BIN="/Users/pattybot/.local/bin/browser-use"
-NODE_BIN="/opt/homebrew/bin/node"
+AUTH_BIN="$(dirname "$(realpath "$0")")/cards-auth.py"
+CODEX_BIN="/Users/pattybot/.npm-global/bin/codex"
+OFFERS_BIN="$(dirname "$(realpath "$0")")/cards-offers.py"
+SANDBOX_EXEC="/usr/bin/sandbox-exec"
+AGENT_SANDBOX="/Users/pattybot/dotfiles/cards/config/cards-agent.sb"
+OP_BIN="/Users/pattybot/.local/bin/op"
 SHLOCK_BIN="/usr/bin/shlock"
 PYTHON_BIN="/usr/bin/python3"
 PREFIRE_BIN="$(dirname "$(realpath "$0")")/cards-prefire.sh"
@@ -65,6 +68,21 @@ write_failure() {
     > "${state_dir}/last-failure.json" 2>/dev/null || true
 }
 
+send_operator_notice() {
+  local plain="$1"
+  local helper="/Users/pattybot/dotfiles/twitter/bin/lib/telegram-send.sh"
+  [ -x "$helper" ] || return 0
+  local run_dir="/tmp/credit-card-offers-notice.$$"
+  mkdir -p "$run_dir" || return 0
+  chmod 700 "$run_dir" 2>/dev/null || true
+  printf '%s' "$plain" > "$run_dir/message.txt"
+  TELEGRAM_CHAT_ID=7953915703 \
+  TELEGRAM_MESSAGE_FILE="$run_dir/message.txt" \
+  TELEGRAM_MESSAGE_PLAIN_FILE="$run_dir/message.txt" \
+  RUN_DIR="$run_dir" "$helper" >/dev/null 2>&1 || true
+  rm -rf "$run_dir"
+}
+
 if [ -z "$SKILL_NAME" ]; then
   echo "usage: cards-fire.sh <skill-name> [--dry-run]" >&2
   exit 64
@@ -77,13 +95,18 @@ if [ ! -f "$SKILL_PATH" ]; then
   exit 65
 fi
 
-for bin in "$CLAUDE_BIN" "$BROWSER_USE_BIN" "$NODE_BIN" "$SHLOCK_BIN" "$PYTHON_BIN" "$PREFIRE_BIN"; do
+for bin in "$AUTH_BIN" "$CODEX_BIN" "$OFFERS_BIN" "$OP_BIN" "$SHLOCK_BIN" "$PYTHON_BIN" "$PREFIRE_BIN" "$SANDBOX_EXEC"; do
   if [ ! -x "$bin" ]; then
     echo "ERROR: missing binary $bin — reinstall or update wrapper paths" >&2
     write_failure "config" "missing binary $bin"
     exit 127
   fi
 done
+if [ ! -r "$AGENT_SANDBOX" ]; then
+  echo "ERROR: missing agent sandbox profile $AGENT_SANDBOX" >&2
+  write_failure "config" "missing agent sandbox profile"
+  exit 127
+fi
 
 mkdir -p "$(dirname "$LOCK_FILE")"
 
@@ -128,15 +151,74 @@ trap 'rm -f "$LOCK_FILE" "$FIRE_IN_PROGRESS_LOCK"' EXIT INT TERM
   SAVED_FRONTMOST_PID=$(echo "$PREFIRE_OUT" | grep '^SAVED_FRONTMOST_PID=' | tail -1 | cut -d= -f2)
   BOT_CHROME_PID=$(echo "$PREFIRE_OUT" | grep -oE 'activating bot Chrome PID=[0-9]+' | head -1 | cut -d= -f2)
 
+  # Authenticate before handing the already-logged-in pages to the agentic
+  # offer workflow. cards-auth.py emits metadata only; never secret values.
   if [[ "$DRY_RUN_FLAG" == "--dry-run" ]]; then
-    PROMPT="Run the ${SKILL_NAME} skill defined in $SKILL_PATH in dry-run mode — execute it as described there but skip the Telegram send and state-file writes."
+    AUTH_OUT=$("$AUTH_BIN" login --dry-run 2>&1)
   else
-    PROMPT="Run the ${SKILL_NAME} skill defined in $SKILL_PATH — execute it as described there."
+    AUTH_OUT=$("$AUTH_BIN" login 2>&1)
+  fi
+  AUTH_STATUS=$?
+  echo "  auth: $AUTH_OUT"
+  if [[ "$AUTH_STATUS" != "0" ]]; then
+    AUTH_KIND=$(printf '%s' "$AUTH_OUT" | "$PYTHON_BIN" -c 'import json,sys
+try: print(json.load(sys.stdin).get("kind", "auth"))
+except Exception: print("auth")' 2>/dev/null || echo auth)
+    case "$AUTH_KIND" in
+      config|onepassword|browser|auth|mfa|challenge|dom) ;;
+      *) AUTH_KIND="auth" ;;
+    esac
+    write_failure "$AUTH_KIND" "secure 1Password login failed (see cards-fire.log)"
+    if [[ "$DRY_RUN_FLAG" != "--dry-run" ]]; then
+      send_operator_notice "💳 Card offers paused: secure bank login failed. Check the Mac mini cards-fire log; manual MFA or 1Password setup may be required. No credential submission was retried."
+    fi
+    echo "----- exit $AUTH_STATUS (authentication failed) at $(iso_utc_now) -----"
+    exit "$AUTH_STATUS"
   fi
 
-  cd "$HOME"
-  "$CLAUDE_BIN" -p "$PROMPT" --output-format text
-  STATUS=$?
+  # Post-login offer handling stays agentic because both bank UIs drift.
+  # Codex auth is verified to work from the launchd GUI domain; the agent
+  # never receives bank credentials and is constrained by the skill rules to
+  # the already-authenticated CDP tabs and offer-activation controls.
+  CODEX_PROMPT="Read /Users/pattybot/dotfiles/cards/.claude/skills/credit-card-offers/SKILL.md completely, then execute that skill now. Authentication has already completed. Follow every hard rule, process both Chase and Amex, persist accurate partial progress, and send the Telegram report. Do not perform login or read 1Password."
+  if [[ "$DRY_RUN_FLAG" == "--dry-run" ]]; then
+    CODEX_PROMPT="$CODEX_PROMPT Run in dry-run mode: do not click, send Telegram, or write state."
+  fi
+  cd "/Users/pattybot/dotfiles/cards"
+  AGENT_OUT=$(mktemp /tmp/cards-agent-output.XXXXXX)
+  </dev/null "$SANDBOX_EXEC" -f "$AGENT_SANDBOX" "$CODEX_BIN" exec --ephemeral --skip-git-repo-check \
+    -C "/Users/pattybot/dotfiles/cards" \
+    -m gpt-5.4 \
+    -s danger-full-access -c 'approval_policy="never"' \
+    "$CODEX_PROMPT" 2>&1 | tee "$AGENT_OUT"
+  STATUS=${PIPESTATUS[0]}
+
+  # Model credits/auth are not allowed to make the bank job unavailable.
+  # This fallback uses the same live-state transitions the agentic runbook
+  # validated, and only runs for a model-service failure.
+  if [[ "$STATUS" != "0" ]] && grep -Eqi 'usage limit|purchase more credits|401 Invalid authentication credentials|Selected model is at capacity' "$AGENT_OUT"; then
+    echo "  agent unavailable before completion; running validated browser fallback"
+    if [[ "$DRY_RUN_FLAG" == "--dry-run" ]]; then
+      "$OFFERS_BIN" --dry-run
+    else
+      "$OFFERS_BIN"
+    fi
+    STATUS=$?
+  fi
+  rm -f "$AGENT_OUT"
+
+  # Always attempt explicit bank sign-out after a live run, including when
+  # the offer agent fails. This cleanup never reads 1Password.
+  if [[ "$DRY_RUN_FLAG" != "--dry-run" ]]; then
+    LOGOUT_OUT=$("$AUTH_BIN" logout 2>&1)
+    LOGOUT_STATUS=$?
+    echo "  logout: $LOGOUT_OUT"
+    if [[ "$LOGOUT_STATUS" != "0" && "$STATUS" == "0" ]]; then
+      STATUS=$LOGOUT_STATUS
+      write_failure "logout" "offer run completed but explicit sign-out failed"
+      send_operator_notice "⚠️ Card offers completed, but one or more bank sign-outs could not be verified. Check the Mac mini cards-fire log and sign out manually."
+    fi
+  fi
 
   # Post-fire frontmost restore. Only if:
   #   1. Saved PID is non-empty.
@@ -167,50 +249,6 @@ OSA
     else
       echo "  post-fire: user moved to PID=$POST_FIRE_FRONTMOST during scrape; not restoring"
     fi
-  fi
-
-  # Park Amex and Chase tabs on their offers URLs so the next keepalive
-  # iteration finds them in a stable location. Bounded; best-effort.
-  park_offers_tabs() {
-    /usr/bin/python3 - <<'PY'
-import json, sys, time, urllib.request
-try:
-    import websocket
-except ImportError:
-    print("park_offers_tabs: websocket-client missing", file=sys.stderr); sys.exit(0)
-try:
-    tabs = json.loads(urllib.request.urlopen("http://127.0.0.1:19223/json", timeout=3).read())
-except Exception as e:
-    print(f"park_offers_tabs: cannot list tabs: {e}", file=sys.stderr); sys.exit(0)
-targets = [
-    ("americanexpress.com", "https://global.americanexpress.com/offers/eligible"),
-    ("chase.com",           "https://secure.chase.com/web/auth/dashboard#/dashboard/offers/offerHub"),
-]
-for needle, url in targets:
-    tab = next((t for t in tabs if t.get("type") == "page" and needle in (t.get("url") or "")), None)
-    if not tab:
-        continue
-    try:
-        ws = websocket.create_connection(tab["webSocketDebuggerUrl"], suppress_origin=True, timeout=5)
-        ws.send(json.dumps({"id": 1, "method": "Page.navigate", "params": {"url": url}}))
-        ws.settimeout(5)
-        try:
-            ws.recv()
-        except Exception:
-            pass
-        ws.close()
-    except Exception as e:
-        print(f"park_offers_tabs: nav {needle} failed: {e}", file=sys.stderr)
-    time.sleep(2)
-PY
-  }
-
-  # Skip parking on failure so operator can VNC in and see the failure page
-  # (auth-wall, MFA challenge, etc.). Park only on clean exits.
-  if [[ "$STATUS" == "0" ]]; then
-    park_offers_tabs || true
-  else
-    echo "fire: STATUS=$STATUS, skipping park_offers_tabs (preserve failure state for VNC inspection)" >&2
   fi
 
   echo "----- exit $STATUS at $(iso_utc_now) -----"

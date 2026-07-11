@@ -10,6 +10,10 @@ A GNU Stow package (`cards/`) inside `~/dotfiles`. Running `stow -t ~ -R cards` 
 |---|---|
 | `bin/cards-fire.sh` | `~/bin/cards-fire.sh` |
 | `bin/cards-prefire.sh` | `~/bin/cards-prefire.sh` |
+| `bin/cards-auth.py` | `~/bin/cards-auth.py` |
+| `bin/cards-keychain.swift` | `~/bin/cards-keychain.swift` |
+| `bin/cards-onepassword-provision.sh` | `~/bin/cards-onepassword-provision.sh` |
+| `bin/cards-onepassword-setup.sh` | `~/bin/cards-onepassword-setup.sh` |
 | `bin/cards-bot-chrome-setup.sh` | `~/bin/cards-bot-chrome-setup.sh` |
 | `bin/cards-keepalive.sh` | `~/bin/cards-keepalive.sh` |
 | `Library/LaunchAgents/com.pattybot.cards-bot-chrome.plist` | `~/Library/LaunchAgents/com.pattybot.cards-bot-chrome.plist` |
@@ -25,14 +29,14 @@ There is no build, lint, or test step. The codebase is bash + macOS launchd plis
 
 Mirrors the twitter package's two-job pattern, extended to three. Three launchd jobs cooperate:
 
-1. **`com.pattybot.cards-bot-chrome`** — `KeepAlive: true`, runs `Google Chrome.app` with `--user-data-dir=~/Library/Application Support/cards-bot-chrome --remote-debugging-port=19223`. **Always running.** This is the only Chrome the offers skill ever talks to — its persistent profile holds the Chase + Amex session cookies. Coexists with the twitter bot Chrome (9222) and the user's daily Chrome because Chromium's process singleton is keyed on `--user-data-dir`.
+1. **`com.pattybot.cards-bot-chrome`** — `KeepAlive: true`, runs `Google Chrome.app` with `--user-data-dir=~/Library/Application Support/cards-bot-chrome --remote-debugging-port=19223`. **Always running.** This is the only Chrome the offers workflow talks to. It is signed in fresh for each daily fire and explicitly signed out afterward.
 2. **`com.pattybot.credit-card-offers`** — `StartCalendarInterval` at 03:00 local time daily, fires `bin/cards-fire.sh credit-card-offers`. `RunAtLoad=false` so a fresh launchctl-bootstrap doesn't trigger a mid-day fire against bank sites — only the next 03:00.
-3. **`com.pattybot.cards-keepalive`** — `StartInterval: 300` (every 5 min), `RunAtLoad: true`. Fires `bin/cards-keepalive.sh`. Pokes the daemon Chrome's Amex/Chase tabs with `Page.bringToFront` + 1–3 px scroll to reset bank-side idle timers, and observes session state. Telegrams the operator on auth-wall transitions (per-issuer 6h cooldown). See `docs/superpowers/specs/2026-05-13-cards-session-keepalive-design.md`.
+3. **`com.pattybot.cards-keepalive`** — legacy and intentionally unloaded. Daily 1Password login + explicit logout replaced session keepalive.
 
 The fire wrapper is split into two pieces, structurally identical to twitter:
 
 - **`bin/cards-prefire.sh`** — OS plumbing only. Health-checks `http://127.0.0.1:19223/json/version` for up to 12s; disambiguates the cards bot Chrome from the twitter bot Chrome and the user's daily Chrome via `lsof -iTCP:19223 -sTCP:LISTEN -t`; CDP-unminimizes bot Chrome windows; pre-warms System Events; PID-activates the bot Chrome with a 30s timeout; bounded-polls activation settlement. Emits `SAVED_FRONTMOST_PID=<pid>` as its final stdout line. Does NOT invoke claude or touch Telegram.
-- **`bin/cards-fire.sh <skill-name>`** — orchestrator. Acquires shared shlock at `~/.claude/skills/.cards-fire.lock` (exits 3 with `kind:busy` on conflict); writes `state/fire-in-progress.lock` for the keepalive to honor; calls prefire; runs `claude -p` against the named skill's SKILL.md; parks Amex + Chase tabs on their offers URLs after the fire body; restores prior frontmost only if bot Chrome is still frontmost at restore time; trap (single, combined) removes BOTH locks on exit. One wrapper, room for multiple skills under the `cards` package umbrella.
+- **`bin/cards-fire.sh <skill-name>`** — orchestrator. It calls prefire, runs `cards-auth.py login` using least-privilege 1Password references, runs the browser-aware skill through `codex exec` inside the macOS Seatbelt profile `config/cards-agent.sb`, falls back to the validated `cards-offers.py` browser driver only when the model service is unavailable, and always runs `cards-auth.py logout` after a live attempt.
 
 The keepalive wrapper is a separate one-shot:
 
@@ -70,8 +74,9 @@ Two reference files document operational behavior:
 # Refresh stow symlinks (after adding/moving/renaming files in the repo)
 cd ~/dotfiles && stow -t ~ -R cards
 
-# One-time bootstrap (interactive — opens browser, requires manual login)
+# One-time bootstrap (interactive)
 ~/dotfiles/cards/bin/cards-bot-chrome-setup.sh
+~/dotfiles/cards/bin/cards-onepassword-provision.sh
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.cards-bot-chrome.plist
 
 # Then VNC into the Mac mini, sign into chase.com + americanexpress.com
@@ -127,12 +132,17 @@ Logs:
 
 - **State directory is gitignored.** `**/state/` matches `~/.claude/skills/credit-card-offers/state/`. It holds `last-success.json`, `last-failure.json`, `pending.json`, `chase-activated.json`, `amex-activated.json` — none of those should ever be committed. The dedup files double as a privacy-sensitive activity log of which merchants you've been offered.
 - **Dedup is offer-ID-keyed, no TTL.** Unlike twitter-digest's 7d URL TTL, the cards dedup keeps every activated offer ID forever. Bank offers expire on their own; once activated, the offer remains activated for the operator until expiration. The dedup file doubles as audit log.
-- **Wrapper paths are absolute on purpose.** `bin/cards-fire.sh` and `bin/cards-prefire.sh` hardcode `/Users/pattybot/.local/bin/claude`, `/Users/pattybot/.local/bin/browser-use`, `/opt/homebrew/bin/node`. launchd's PATH is minimal; relying on `PATH` lookup will silently break under launchd. Same for `HOME` — both wrappers `export HOME=/Users/pattybot` before referencing `$HOME`.
+- **Wrapper paths are absolute on purpose.** `bin/cards-fire.sh` and `bin/cards-prefire.sh` hardcode the Codex CLI, system Python, 1Password CLI, and CDP helper paths. launchd's PATH is minimal; relying on `PATH` lookup will silently break under launchd. Same for `HOME` — both wrappers `export HOME=/Users/pattybot` before referencing `$HOME`.
 - **macOS python3 vs Homebrew python3.** The pre-fire CDP un-minimize block pins `/usr/bin/python3` explicitly because it has `websocket-client` available via the system user-site while `/opt/homebrew/bin/python3` does not. Don't "simplify" that to bare `python3`.
 - **Plist `ProcessType: Interactive`** on both jobs is required so the daemon Chrome is allowed to render and the wrapper is allowed to script System Events. Don't downgrade it to `Background`.
 - **`KeepAlive: true` on the bot-chrome plist implies an initial speculative launch**, so `RunAtLoad` is intentionally absent.
 - **HTML, not Markdown, when delivering to Telegram.** Merchant names routinely contain `_*[` (e.g. "Brooks_Brothers"); legacy Telegram Markdown breaks on these. The escape pipeline (`& → &amp;`, `< → &lt;`, `> → &gt;`, applied last) is critical — don't reorder it.
-- **NEVER programmatically log in.** Banks aggressively flag automated logins, and any credential-typing risks account lockout. The only login path is the user manually signing into the bot Chrome window once during bootstrap; ongoing sessions ride on persistent cookies.
+- **Login is isolated to `bin/cards-auth.py`.** It resolves secret-reference URIs with a read-only, vault-scoped 1Password service account, submits each login at most once, automates only an unambiguous TOTP field, redacts inputs before screenshots, and never prints secret values. Do not add credential handling to the skill or shell wrappers.
+- **The agent boundary is enforced, not prompt-only.** `config/cards-agent.sb`
+  denies the Codex process and its children access to 1Password, Login
+  Keychain/securityd, credential helpers/config, auth code, and security
+  control files while retaining CDP/state/Telegram access. Authentication and
+  the reviewed deterministic fallback run outside that model sandbox.
 - **NEVER click anything but the activate-offer buttons.** Mid-run action set is exactly: enumerate offer tiles, click "Add to card" on each unactivated one, verify state change, record. Clicking ANY other button (even dismiss-y "Got it" / "Continue" / "OK" prompts) is forbidden — those can commit you to TOS/consent terms and are behavioral signatures.
 
 ## What "fixing it" usually does NOT mean
