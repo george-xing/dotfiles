@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pattybot.claude-telegram</string>
+
+    <!-- Standalone Bot API receiver. It loads the protected setup token and
+         spawns one non-interactive Claude process per accepted message. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/pattybot/bin/with-claude-setup-token</string>
+        <string>/Users/pattybot/.bun/bin/bun</string>
+        <string>/Users/pattybot/.claude/channels/telegram/telegram-receiver.ts</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/pattybot/.claude</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/pattybot</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/Users/pattybot/.local/bin:/Users/pattybot/.npm-global/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+        <key>LC_ALL</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+
+    <!-- Respawn on crash but not on clean /exit (exit 0). launchd's default
+         ~10s throttle between respawns is fine for this workload. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Receiver emits structured lifecycle events to stderr. -->
+    <key>StandardOutPath</key>
+    <string>/Users/pattybot/Library/Logs/claude-telegram.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/pattybot/Library/Logs/claude-telegram.err.log</string>
+</dict>
+</plist>

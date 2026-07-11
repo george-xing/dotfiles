@@ -1,0 +1,20 @@
+#!/bin/zsh
+
+set -eu
+
+token_file="${HOME}/.claude/secrets/setup-token"
+
+if [[ ! -r "$token_file" ]]; then
+  print -u2 "Claude setup token is missing or unreadable: $token_file"
+  exit 78
+fi
+
+IFS= read -r CLAUDE_CODE_OAUTH_TOKEN < "$token_file"
+
+if [[ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]]; then
+  print -u2 "Claude setup token file is empty: $token_file"
+  exit 78
+fi
+
+export CLAUDE_CODE_OAUTH_TOKEN
+exec "$@"
