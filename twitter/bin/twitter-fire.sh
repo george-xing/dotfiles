@@ -29,6 +29,12 @@ export LC_ALL="en_US.UTF-8"
 
 CLAUDE_BIN="/Users/pattybot/.local/bin/claude"
 CLAUDE_TOKEN_WRAPPER="/Users/pattybot/bin/with-claude-setup-token"
+# The Twitter skills deliver through bin/lib/telegram-send.sh. Loading Claude's
+# Telegram plugin here would also start a getUpdates poller for the same bot,
+# competing with the always-on Hermes gateway and eventually taking it offline.
+# Override only that plugin for this non-interactive child; all other user
+# settings and the file-backed skill workflow remain unchanged.
+CLAUDE_SETTINGS='{"enabledPlugins":{"telegram@claude-plugins-official":false}}'
 BROWSER_USE_BIN="/Users/pattybot/.local/bin/browser-use"
 NODE_BIN="/opt/homebrew/bin/node"
 SHLOCK_BIN="/usr/bin/shlock"
@@ -130,7 +136,8 @@ trap 'rm -f "$LOCK_FILE"' EXIT INT TERM
   fi
 
   cd "$HOME"
-  "$CLAUDE_TOKEN_WRAPPER" "$CLAUDE_BIN" -p "$PROMPT" --output-format text
+  "$CLAUDE_TOKEN_WRAPPER" "$CLAUDE_BIN" -p "$PROMPT" --output-format text \
+    --settings "$CLAUDE_SETTINGS"
   STATUS=$?
 
   # Post-fire frontmost restore. Only if:
