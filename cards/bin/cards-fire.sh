@@ -1,4 +1,8 @@
 #!/bin/bash
+# Retired after migration to Hermes on 2026-09-20.
+printf '%s\n' "Retired: cards now run through Hermes. Use hermes cron list and the credit-card-offers skill; do not provision a separate Keychain token." >&2
+exit 64
+
 # cards-fire.sh — orchestrator for a single fire of one cards skill.
 #
 # Usage:
@@ -83,6 +87,18 @@ send_operator_notice() {
   rm -rf "$run_dir"
 }
 
+perform_logout() {
+  LOGOUT_OUT=""
+  LOGOUT_STATUS=0
+  if [[ "$DRY_RUN_FLAG" == "--dry-run" ]]; then
+    return 0
+  fi
+  LOGOUT_OUT=$("$AUTH_BIN" logout 2>&1)
+  LOGOUT_STATUS=$?
+  echo "  logout: $LOGOUT_OUT"
+  return 0
+}
+
 if [ -z "$SKILL_NAME" ]; then
   echo "usage: cards-fire.sh <skill-name> [--dry-run]" >&2
   exit 64
@@ -137,7 +153,8 @@ echo "$$ $(date -u +%FT%TZ)" > "$FIRE_IN_PROGRESS_LOCK.tmp.$$" && \
 trap 'rm -f "$LOCK_FILE" "$FIRE_IN_PROGRESS_LOCK"' EXIT INT TERM
 
 {
-  echo "===== fire $(iso_utc_now) skill=${SKILL_NAME} ====="
+  FIRE_STARTED_AT=$(iso_utc_now)
+  echo "===== fire $FIRE_STARTED_AT skill=${SKILL_NAME} ====="
 
   PREFIRE_OUT=$("$PREFIRE_BIN" 2>&1)
   PREFIRE_EXIT=$?
@@ -160,27 +177,81 @@ trap 'rm -f "$LOCK_FILE" "$FIRE_IN_PROGRESS_LOCK"' EXIT INT TERM
   fi
   AUTH_STATUS=$?
   echo "  auth: $AUTH_OUT"
-  if [[ "$AUTH_STATUS" != "0" ]]; then
+  AUTH_READY_COUNT=$(printf '%s' "$AUTH_OUT" | "$PYTHON_BIN" -c 'import json,sys
+try:
+    results=json.load(sys.stdin).get("results", [])
+    print(sum(x.get("status") in ("authenticated","already_authenticated","authenticated_totp") for x in results))
+except Exception:
+    print(0)' 2>/dev/null || echo 0)
+  AUTH_AVAILABLE_ISSUERS=$(printf '%s' "$AUTH_OUT" | "$PYTHON_BIN" -c 'import json,sys
+try:
+    results=json.load(sys.stdin).get("results", [])
+    print(",".join(x.get("issuer","") for x in results if x.get("status") in ("authenticated","already_authenticated","authenticated_totp")))
+except Exception:
+    print("")' 2>/dev/null || true)
+  AUTH_FAILURES_JSON=$(printf '%s' "$AUTH_OUT" | "$PYTHON_BIN" -c 'import json,sys
+try:
+    data=json.load(sys.stdin)
+    failures=[{"issuer":x.get("issuer","issuer"),"kind":x.get("kind","auth"),"message":x.get("message","authentication failed")} for x in data.get("results",[]) if x.get("status") in ("error","login_required")]
+    print(json.dumps(failures))
+except Exception:
+    print("[]")' 2>/dev/null || echo '[]')
+  AUTH_CONTEXT=$(printf '%s' "$AUTH_OUT" | "$PYTHON_BIN" -c 'import json,sys
+try:
+    results=json.load(sys.stdin).get("results", [])
+    parts=[]
+    for result in results:
+        issuer=result.get("issuer","issuer")
+        status=result.get("status","unknown")
+        if status in ("authenticated","already_authenticated","authenticated_totp"):
+            parts.append(f"{issuer}=available")
+        else:
+            parts.append("{}=unavailable(kind:{})".format(issuer,result.get("kind","auth")))
+    print(", ".join(parts) or "no issuer results")
+except Exception:
+    print("no issuer results")' 2>/dev/null || echo "no issuer results")
+
+  if [[ "$AUTH_STATUS" != "0" && "$AUTH_READY_COUNT" -eq 0 ]]; then
+    AUTH_SUMMARY=$(printf '%s' "$AUTH_OUT" | "$PYTHON_BIN" -c 'import json,sys
+try:
+    data=json.load(sys.stdin)
+    failures=[]
+    for result in data.get("results", []):
+        if result.get("status") == "error":
+            issuer=result.get("issuer", "issuer")
+            kind=result.get("kind", "auth")
+            message=result.get("message", "authentication failed")
+            failures.append(f"{issuer} kind:{kind} — {message}")
+    print("; ".join(failures) or data.get("message", "secure bank login failed"))
+except Exception:
+    print("secure bank login failed")' 2>/dev/null || echo "secure bank login failed")
     AUTH_KIND=$(printf '%s' "$AUTH_OUT" | "$PYTHON_BIN" -c 'import json,sys
-try: print(json.load(sys.stdin).get("kind", "auth"))
+try:
+    data=json.load(sys.stdin)
+    failures=[x for x in data.get("results",[]) if x.get("status") in ("error","login_required")]
+    print((failures[0].get("kind") if failures else data.get("kind")) or "auth")
 except Exception: print("auth")' 2>/dev/null || echo auth)
     case "$AUTH_KIND" in
       config|onepassword|browser|auth|mfa|challenge|dom) ;;
       *) AUTH_KIND="auth" ;;
     esac
-    write_failure "$AUTH_KIND" "secure 1Password login failed (see cards-fire.log)"
+    write_failure "$AUTH_KIND" "$AUTH_SUMMARY"
     if [[ "$DRY_RUN_FLAG" != "--dry-run" ]]; then
-      send_operator_notice "💳 Card offers paused: secure bank login failed. Check the Mac mini cards-fire log; manual MFA or 1Password setup may be required. No credential submission was retried."
+      send_operator_notice "💳 Card offers paused: $AUTH_SUMMARY. No credential submission was retried."
     fi
+    perform_logout
     echo "----- exit $AUTH_STATUS (authentication failed) at $(iso_utc_now) -----"
     exit "$AUTH_STATUS"
+  fi
+  if [[ "$AUTH_STATUS" != "0" ]]; then
+    echo "  auth: partial availability ($AUTH_CONTEXT); continuing with authenticated issuer(s)"
   fi
 
   # Post-login offer handling stays agentic because both bank UIs drift.
   # Codex auth is verified to work from the launchd GUI domain; the agent
   # never receives bank credentials and is constrained by the skill rules to
   # the already-authenticated CDP tabs and offer-activation controls.
-  CODEX_PROMPT="Read /Users/pattybot/dotfiles/cards/.claude/skills/credit-card-offers/SKILL.md completely, then execute that skill now. Authentication has already completed. Follow every hard rule, process both Chase and Amex, persist accurate partial progress, and send the Telegram report. Do not perform login or read 1Password."
+  CODEX_PROMPT="Read /Users/pattybot/dotfiles/cards/.claude/skills/credit-card-offers/SKILL.md completely, then execute that skill now. Authentication boundary: $AUTH_CONTEXT. Process only issuers marked available; do not navigate, probe, or submit credentials for unavailable issuers. Treat unavailable issuers as authentication failures in the partial report. Follow every hard rule, persist accurate partial progress, and send the Telegram report. Do not perform login or read 1Password."
   if [[ "$DRY_RUN_FLAG" == "--dry-run" ]]; then
     CODEX_PROMPT="$CODEX_PROMPT Run in dry-run mode: do not click, send Telegram, or write state."
   fi
@@ -199,20 +270,68 @@ except Exception: print("auth")' 2>/dev/null || echo auth)
   if [[ "$STATUS" != "0" ]] && grep -Eqi 'usage limit|purchase more credits|401 Invalid authentication credentials|Selected model is at capacity' "$AGENT_OUT"; then
     echo "  agent unavailable before completion; running validated browser fallback"
     if [[ "$DRY_RUN_FLAG" == "--dry-run" ]]; then
-      "$OFFERS_BIN" --dry-run
+      CARDS_AVAILABLE_ISSUERS="$AUTH_AVAILABLE_ISSUERS" \
+      CARDS_AUTH_FAILURES_JSON="$AUTH_FAILURES_JSON" \
+        "$OFFERS_BIN" --dry-run
     else
-      "$OFFERS_BIN"
+      CARDS_AVAILABLE_ISSUERS="$AUTH_AVAILABLE_ISSUERS" \
+      CARDS_AUTH_FAILURES_JSON="$AUTH_FAILURES_JSON" \
+        "$OFFERS_BIN"
     fi
     STATUS=$?
   fi
   rm -f "$AGENT_OUT"
 
+  # A successful model/process exit is not sufficient evidence that the live
+  # bank workflow succeeded. The offer agent may have delivered a failure
+  # digest successfully and accidentally propagated Telegram's zero exit code
+  # (as happened on 2026-07-15). Require this fire to have atomically advanced
+  # last-success.json with successful Telegram delivery before launchd sees 0.
+  if [[ "$DRY_RUN_FLAG" != "--dry-run" && "$STATUS" == "0" ]]; then
+    LAST_SUCCESS="$HOME/.claude/skills/$SKILL_NAME/state/last-success.json"
+    STATE_CHECK=$(
+      "$PYTHON_BIN" - "$FIRE_STARTED_AT" "$LAST_SUCCESS" <<'PY'
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+started_raw, path = sys.argv[1:]
+try:
+    started = datetime.fromisoformat(started_raw.replace("Z", "+00:00"))
+    state = json.load(open(path))
+    completed = datetime.fromisoformat(str(state["runAt"]).replace("Z", "+00:00"))
+    if completed >= started and state.get("telegramOk") is True:
+        # Success is authoritative now; a pending marker from this or an older
+        # interrupted fire is stale and must not survive terminal validation.
+        try:
+            Path(path).with_name("pending.json").unlink()
+        except FileNotFoundError:
+            pass
+        print("ok")
+        raise SystemExit(0)
+    print("last-success is stale or Telegram was not confirmed")
+except Exception as exc:
+    print(f"no valid current success state: {type(exc).__name__}")
+raise SystemExit(1)
+PY
+    )
+    STATE_CHECK_STATUS=$?
+    if [[ "$STATE_CHECK_STATUS" != "0" ]]; then
+      echo "  terminal-state validation failed: $STATE_CHECK"
+      STATUS=4
+      # Preserve a richer issuer failure written by the agent. Only synthesize
+      # state failure metadata when no failure record exists at all.
+      if [[ ! -f "$HOME/.claude/skills/$SKILL_NAME/state/last-failure.json" ]]; then
+        write_failure "state" "agent exited zero without current successful terminal state"
+      fi
+    fi
+  fi
+
   # Always attempt explicit bank sign-out after a live run, including when
   # the offer agent fails. This cleanup never reads 1Password.
   if [[ "$DRY_RUN_FLAG" != "--dry-run" ]]; then
-    LOGOUT_OUT=$("$AUTH_BIN" logout 2>&1)
-    LOGOUT_STATUS=$?
-    echo "  logout: $LOGOUT_OUT"
+    perform_logout
     if [[ "$LOGOUT_STATUS" != "0" && "$STATUS" == "0" ]]; then
       STATUS=$LOGOUT_STATUS
       write_failure "logout" "offer run completed but explicit sign-out failed"

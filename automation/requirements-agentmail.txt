@@ -1,0 +1,2 @@
+# Installed into the same venv as the Hermes gateway/cron interpreter.
+agentmail==2.0.6

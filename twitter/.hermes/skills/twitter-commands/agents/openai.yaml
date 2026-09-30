@@ -1,0 +1,4 @@
+interface:
+  display_name: "Twitter Commands"
+  short_description: "Dispatch digest, bookmark, and X search commands"
+  default_prompt: "Use $twitter-commands to route this owner Telegram request to the matching production Twitter workflow."

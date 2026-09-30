@@ -39,12 +39,11 @@
 
 set -uo pipefail
 
-BROWSER_USE_BIN="/Users/pattybot/.local/bin/browser-use"
+BROWSER_USE_BIN="/Users/pattybot/dotfiles/twitter/bin/twitter-browser.sh"
 PYTHON_BIN="/usr/bin/python3"
-CDP_URL="http://127.0.0.1:9222"
 MAX="${MAX:-80}"
 
-RAW=$("$BROWSER_USE_BIN" --cdp-url "$CDP_URL" eval "
+RAW=$("$BROWSER_USE_BIN" eval "
   JSON.stringify(
     Array.from(document.querySelectorAll('article[data-testid=\"tweet\"]')).slice(0, ${MAX}).map(a => {
       const author = a.querySelector('[data-testid=\"User-Name\"]')?.innerText || '';

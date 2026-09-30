@@ -5,7 +5,7 @@ description: Dispatch a twitter-bookmarks fire in response to a Telegram DM. Use
 
 # Twitter Bookmarks Dispatch
 
-Runs in your paired Claude Code session. When a Telegram DM matches a bookmark-trigger phrase, fire this skill to kick off the scrape in the background without blocking the live conversation. The actual scrape runs through `~/dotfiles/twitter/bin/twitter-fire.sh twitter-bookmarks` so it inherits the orchestrator's flock + post-fire frontmost restore invariants.
+Runs in your paired Claude Code session. When a Telegram DM matches a bookmark-trigger phrase, fire this skill to kick off the scrape in the background without blocking the live conversation. The actual scrape runs through `~/dotfiles/twitter/bin/twitter-fire.sh twitter-bookmarks` so it inherits the orchestrator's lock, hard deadline, delivery proof, and post-fire frontmost-restore invariants.
 
 ## Trigger phrases (case-insensitive, matched against DM text)
 
@@ -72,11 +72,13 @@ Use the `Agent` tool with:
 - `prompt`:
 
 ```
-Run the command `/Users/pattybot/dotfiles/twitter/bin/twitter-fire.sh twitter-bookmarks` via the Bash tool. Wait for it to complete (~5-10 minutes typical). The wrapper handles its own flock acquisition, prefire foregrounding, claude -p invocation against the bookmark skill, Telegram delivery, and post-fire frontmost restore — you do NOT need to do any of those yourself.
+Run the command `/Users/pattybot/dotfiles/twitter/bin/twitter-fire.sh twitter-bookmarks` via the Bash tool. Wait for it to complete (~5-10 minutes typical). The wrapper handles its own lock acquisition, prefire foregrounding, Hermes one-shot invocation against the bookmark skill, Telegram delivery proof, deadline, and post-fire frontmost restore — you do NOT need to do any of those yourself.
 
 When Bash returns, read the last 30 lines of ~/Library/Logs/twitter-fire.log and return a single sentence summary based on the exit code:
 - exit 0 → "Bookmark fire delivered; see Telegram."
 - exit 3 → "Bookmark fire skipped — flock held by another twitter-fire (busy)."
+- exit 70 → "Bookmark fire failed — Hermes returned without fresh delivery proof."
+- exit 124 → "Bookmark fire timed out; the wrapper terminated it and released the lock."
 - other → "Bookmark fire failed with exit <N>; see ~/.claude/skills/twitter-bookmarks/state/last-failure.json."
 
 Do not call any other tools. Do not narrate progress. One sentence at the end.

@@ -5,7 +5,7 @@ description: Generate the X (Twitter) digest — attaches via CDP to a long-runn
 
 # Twitter Digest
 
-Twice-daily job: attach to the persistent bot Chrome on `127.0.0.1:9222`, scroll x.com/home, summarize themed content into Telegram. The two scheduled fires are 08:00 ET (overnight recap) and 22:00 ET (daytime recap). **No time cutoff** — the natural stop signal is URL dedup against `state/digested-urls.json` (we don't repeat anything we've already summarized) + the 3-min wall budget + feed plateau. This mirrors how a human reads X: scroll until you recognize stuff you've already seen, then stop. Designed to be fired headlessly via `claude -p` from launchd, but works fine when invoked interactively.
+Twice-daily job: attach to the persistent bot Chrome on `127.0.0.1:9222`, scroll x.com/home, summarize themed content into Telegram. The two scheduled fires are 08:00 ET (overnight recap) and 22:00 ET (daytime recap). **No time cutoff** — the natural stop signal is URL dedup against `state/digested-urls.json` (we don't repeat anything we've already summarized) + the 5-min collection wall budget + feed plateau. This mirrors how a human reads X: scroll until you recognize stuff you've already seen, then stop. Designed to be executed by a Hermes one-shot through `twitter-fire.sh`, whether fired by Hermes cron or on demand.
 
 ## Inputs (from environment / state)
 
@@ -16,7 +16,40 @@ Twice-daily job: attach to the persistent bot Chrome on `127.0.0.1:9222`, scroll
 - **Telegram chat_id**: `7953915703`.
 - **Themes**: read `references/themes.md` before composing — edits to that file flow into the next digest with no other change.
 
+## Browser isolation and locked-desktop operation
+
+Use `/Users/pattybot/dotfiles/twitter/bin/twitter-browser.sh` for every browser
+command (for example `open`, `eval`, `keys`, `screenshot`). This helper pins the
+compatible CLI and explicitly selects the dedicated `twitter-production` CDP
+session. Never substitute a bare `browser-use`, `browser_exec`, or a new Chrome.
+Digest, bookmarks, and search share the wrapper's existing lock; other Hermes
+requests can continue in their own browsers.
+
+A locked Mac can leave a fully usable X page `hidden`. After one native
+`Page.bringToFront` attempt, permit background reading only when the exact
+`https://x.com` origin and intended route are verified (`/home`, `/i/bookmarks`,
+or `/search` with the requested search input). X also redirects bookmarks to
+`/i/history`; accept that route only when the selected `[role="tab"]` is
+`Bookmarks` (never Likes). Require a non-zero viewport,
+`[data-testid="primaryColumn"]` and authenticated
+`[data-testid="AppTabBar_Profile_Link"]` navigation exist, no login wall exists,
+and the shared `extract-tweets.sh` returns at least one substantive post with
+text or article link, timestamp and status URL. Record `visibilityDegraded: true`.
+A blank document title alone does not indicate logout on a hidden page.
+Apply this content proof whenever desktop visibility is unavailable.
+If the proof fails, stop with the appropriate auth/dom/visibility failure;
+never fake visibility, unlock the Mac, or click its desktop/lock screen.
+
 ## Workflow
+
+**Production collector invariant:** steps 1–3 are implemented by the checked-in
+`/Users/pattybot/dotfiles/twitter/bin/lib/collect-digest.py` helper. Invoke that
+helper once; do not write a throwaway collector, recreate the scroll loop, or
+call an image/vision tool to classify its screenshots. The helper owns the
+bounded browser loop, categorized hard failures, recoveries, persistent stall
+screenshots, and clean-plateau decision. Screenshots are forensic artifacts;
+scheduled execution continues from the helper's JSON outputs without a
+multimodal model round trip.
 
 ### 1. Load digested-URL dedup set
 
@@ -35,59 +68,22 @@ There's no time cutoff. Any tweet whose `statusUrl` is in `digested-urls.json` w
 
 ### 2. Attach to daemon Chrome and verify
 
-The daemon is launchctl-managed; the wrapper has already verified `127.0.0.1:9222` responded before invoking you. Don't re-launch Chrome, don't `browser-use close --all`. Just attach and navigate:
+The production collector performs this step. It navigates through
+`twitter-browser.sh`, requires the exact X Home route and authenticated profile
+navigation, rejects login walls and zero-sized viewports, and verifies the
+primary column. When the desktop is locked, it also requires actual feed
+extraction before accepting background operation. A blank title on a hidden
+tab does not prove logout. See the browser isolation section above.
 
-```bash
-browser-use --cdp-url http://127.0.0.1:9222 open https://x.com/home
-sleep 4
-```
-
-Verify both auth state AND visibility in one probe:
-
-```bash
-browser-use --cdp-url http://127.0.0.1:9222 eval "
-  JSON.stringify({
-    title: document.title,
-    vis: document.visibilityState,
-    iw: innerWidth,
-    ih: innerHeight,
-    hasPrimaryColumn: !!document.querySelector('[data-testid=\\"primaryColumn\\"]'),
-    hasLoginWall: !!document.querySelector('a[href=\\"/login\\"]') || !!document.querySelector('a[href=\\"/i/flow/login\\"]')
-  })
-"
-```
-
-Expected: `vis === "visible"`, `iw > 0`, `ih > 0`, `title === "Home / X"`, `hasPrimaryColumn === true`, `hasLoginWall === false`.
-
-**Failure semantics — hard fail with the matching `kind`, do NOT paper over:**
-
-- `vis !== "visible"` or `iw === 0` → daemon Chrome window is backgrounded. **First attempt CDP self-recovery via `Page.bringToFront`, then re-probe.** Unlike page-lifecycle hacks, `Page.bringToFront` is not fakery — Chromium's `PageHandler::BringToFront` calls `WebContentsImpl::Activate()` + `Focus()`, which on macOS dispatches the same `[NSWindow makeKeyAndOrderFront:]` path a real user click triggers (see `content/browser/devtools/protocol/page_handler.cc:1683`). If `vis` flips to `"visible"` after the call, page and OS state genuinely agree — no mismatch to detect, proceed normally. If `vis` is still `"hidden"` (macOS can resist background-process focus-steal under some conditions), hard-fail: write `state/last-failure.json` with `{ "kind": "visibility", "at": "<iso>", "message": "bot Chrome window not foreground; vis=<state> after bringToFront retry" }` and exit non-zero. Do **NOT** fall back to `Page.setWebLifecycleState("active")` — that one *is* fakery (changes only page lifecycle, OS state stays backgrounded → genuine detectable mismatch). Operator action on hard-fail: bring the bot Chrome window front manually (Mission Control, click the window) and re-fire.
-
-  CDP call snippet (python3 + websocket-client, same pattern as the wrapper's un-minimize step):
-  ```bash
-  /usr/bin/python3 - <<'PY'
-  import json, urllib.request, websocket
-  pages = [t for t in json.loads(urllib.request.urlopen("http://127.0.0.1:9222/json").read())
-           if t.get("type") == "page" and "x.com" in t.get("url", "")]
-  ws = websocket.create_connection(pages[0]["webSocketDebuggerUrl"], suppress_origin=True, timeout=3)
-  ws.send(json.dumps({"id": 1, "method": "Page.bringToFront"}))
-  while True:
-      r = json.loads(ws.recv())
-      if r.get("id") == 1: print("bringToFront:", r); break
-  ws.close()
-  PY
-  sleep 1
-  # then re-run the visibility probe from above
-  ```
-- `hasLoginWall === true` or `title` matches the public landing → cookies expired. Write `state/last-failure.json` with `{ "kind": "auth", "at": "<iso>", "message": "bot Chrome session logged out; sign in via the bot window" }` and exit. Do NOT attempt to log in. Operator action: focus the bot Chrome window, navigate to `https://x.com/i/flow/login`, sign in. The cookies persist in the daemon's profile across restarts.
-- `hasPrimaryColumn === false` despite `vis === "visible"` and no login wall → DOM rendered but timeline container missing. Likely an X UI change; write `kind: "dom"` failure and exit. Operator updates selectors in this skill.
+Do not separately navigate or run a second collector; the setup steps below
+are implemented by `collect-digest.py`.
 
 ### 2b. Refresh feed via Home-tab click
 
 Click the left-nav Home tab while already on `/home`. This is the canonical X gesture for "give me a fresh feed" and triggers an SPA same-route handler that scrolls to top, auto-expands any pending "See new posts" pill, and **re-issues a fresh `home_timeline` API request**. Without this, a long-idle daemon Chrome session can drift into algorithmic throttle where scroll/scrollIntoView won't surface more than a tiny initial batch (the May 8 morning run hit this, plateauing at 4-5 tweets even after every other recovery tactic was exhausted).
 
 ```bash
-browser-use --cdp-url http://127.0.0.1:9222 eval "
+/Users/pattybot/dotfiles/twitter/bin/twitter-browser.sh eval "
   const link = document.querySelector('a[data-testid=\\"AppTabBar_Home_Link\\"]');
   if (link) link.click();
   ({clicked: !!link})
@@ -102,22 +98,26 @@ This setup-time use is **uncounted** — it does not consume the recovery cap of
 x.com/home usually lands on "For You" by default — what this digest consumes (matches what the user reads). The Home-tab click in 2b can occasionally land on a Trends/Following inner-tab state, so this defensive click runs after (no-op if already active):
 
 ```bash
-browser-use --cdp-url http://127.0.0.1:9222 eval "
+/Users/pattybot/dotfiles/twitter/bin/twitter-browser.sh eval "
   const tabs = document.querySelectorAll('[role=\\"tablist\\"] [role=\\"tab\\"]');
   const fyt = Array.from(tabs).find(t => /for you/i.test(t.innerText));
-  fyt?.click();
-  ({clicked: !!fyt})
+  const clicked = !!fyt && fyt.getAttribute('aria-selected') !== 'true';
+  if (clicked) fyt.click();
+  ({clicked})
 "
 sleep 2
 ```
 
+Never re-click an already-selected For You tab: current X opens **Snooze Topics**
+and locks feed scrolling. The collector verifies that For You is selected.
+
 ### 3. Gather feed content
 
-**Goal**: accumulate **as many substantive (non-promoted) tweets as the For You feed will yield** within a **3-minute total wall budget**, using whatever sanctioned tactics the observed state demands. **For You is the only source** — the digest is a faithful read of what X's algorithm surfaced for the user, not a synthetic catch-up assembled from chronological backfill. If For You is sparse (cold-start after long idle, modal-interrupted prefetch, transient throttle), ship under-target rather than reaching elsewhere.
+**Goal**: accumulate **as many substantive (non-promoted) tweets as the For You feed will yield** within a **5-minute collection wall budget**, using whatever sanctioned tactics the observed state demands. **For You is the only source** — the digest is a faithful read of what X's algorithm surfaced for the user, not a synthetic catch-up assembled from chronological backfill. If For You is sparse (cold-start after long idle, modal-interrupted prefetch, transient throttle), ship under-target rather than reaching elsewhere.
 
 This step is intentionally framed as "goal + sanctioned toolkit," not a prescribed loop. The For You feed has many soft-failure modes — algorithmic cold-start, modal interstitials, mid-run prefetch hiccups, virtualization glitches, transient throttles. A rigid "scroll-stall-ship" loop ships thin digests on any of them. The runtime should iterate tactics from the toolkit until the budget is exhausted, the feed plateaus convincingly, or every sanctioned tactic has been tried without yielding new content.
 
-A useful internal target is **~50 substantive tweets** — enough to triage 2-3 substantive bullets per theme. Don't stop early on hitting it; don't fail or escalate on missing it. It's a "is this run going well?" indicator that shapes how aggressively to recover from stalls (well below → keep trying recovery tactics; well above → let plateaus end naturally).
+**George’s scan-breadth preference: aim for at least 150 unique eligible tweets per run**, after promoted/missing-timestamp filters and prior-delivery URL dedup. This is a collection target, **not 150 digest bullets**; keep editorial triage selective. Do not stop merely on reaching 150. Below target, use the existing bounded recoveries; ship an honest shortfall if the feed exhausts them or the wall budget expires, without failing or escalating solely for missing the target. Defaults are `TWITTER_DIGEST_HEALTHY_TARGET=150` and `TWITTER_DIGEST_WALL_SECONDS=300`; do not lower them unless George requests it. The unchanged 600-second wrapper deadline leaves time for setup, article extraction, triage and delivery.
 
 #### Sanctioned tactic toolkit
 
@@ -136,31 +136,37 @@ The only mutating actions allowed in step 3. Apply in whatever order the observe
 
 #### How to drive the loop
 
-1. **Scroll-extract loop**: alternate scroll + call the shared extraction helper. Pause 1-2s after each scroll for hydration:
+Run the production collector exactly once:
 
-   ```bash
-   # Scroll.
-   browser-use --cdp-url http://127.0.0.1:9222 eval "window.scrollBy(0, 1500); 'ok'"
-   sleep 1.5
+```bash
+/usr/bin/python3 /Users/pattybot/dotfiles/twitter/bin/lib/collect-digest.py
+```
 
-   # Extract currently-rendered tiles. Helper returns clean JSON.
-   TILES_JSON=$(MAX=80 /Users/pattybot/dotfiles/twitter/bin/lib/extract-tweets.sh)
-   ```
+On exit `0`, read all three outputs before triage:
 
-   `TILES_JSON` is a JSON array of `{author, text, timeISO, statusUrl, articleLink, isPromoted}`. Inspect `/Users/pattybot/dotfiles/twitter/bin/lib/extract-tweets.sh` for the canonical DOM selectors and the article-detection heuristic (article-cover-image testid AND empty tweetText — combining both eliminates the ~3x false-positive rate that cover-image alone produces on regular tweets with Twitter Card link previews; empirically 151 tiles → 42 cover-image hits → 15 true articles).
+- `/tmp/twitter-digest-run/candidates.json` — filtered, URL-deduplicated tweet candidates.
+- `/tmp/twitter-digest-run/articles.json` — unique article tiles found during collection.
+- `/tmp/twitter-digest-run/collection.json` — actual unique eligible `scanned` count, `scanTarget`, `scanShortfall`, `wallBudgetSeconds`, elapsed time, stop reason, recovery counts, and optional forensic screenshot path.
 
-   Dedupe by `(author, text)` — later scrolls re-emit earlier tweets, and the dedupe key has to be content-based since X's `data-testid` IDs aren't stable across virtualization recycles.
+`reason: "wall_budget"` and `reason: "clean_plateau"` are both normal success
+conditions. Continue directly to article extraction and editorial triage. **Do
+not call `vision_analyze`, inspect the screenshot, or restart collection.** A
+nonzero exit has already written the categorized `last-failure.json`; stop the
+workflow without delivery or state advancement.
 
-2. **When `scrollBy` plateaus** (no new uniques after ~2 scrolls): try `scrollIntoView` on the last article. If that also plateaus (3 consecutive zero-new across both), invoke step 3a (screenshot-then-judge) to pick the next move from the toolkit.
+The helper alternates `scrollBy` and `scrollIntoView`, calls the canonical
+`extract-tweets.sh`, applies hard filters and persistent URL dedup, and spends
+bounded recovery caps when the feed stalls below the healthy target. Once a
+healthy feed has yielded at least 150 unique eligible candidates and run for at least two
+minutes, a repeated clean plateau ships what was accumulated. This avoids
+turning a routine end-of-feed screenshot into a fragile multimodal model call.
 
-3. **Stop the entire run when**:
-   - Wall budget elapsed (3 min total), OR
-   - The For You feed is convincingly exhausted (3a screenshot shows "you're all caught up" / repeated tweets / no obstruction, AND no recovery tactic has any caps remaining), OR
-   - A hard-fail `kind` is set.
-
-   Don't stop early on hitting 50 — content quality scales with volume (more raw → better triage → more substantive bullets per theme), so always burn the full wall budget when content's flowing. Use `len(seen)` against 50 to decide how patient to be at stalls: well under → spend a recovery cap to push through; well over → let the plateau end naturally.
-
-4. **Anti-pattern to avoid: stale-percentage-based early termination.** Per-scroll tracing on For You shows `stale%` oscillates wildly between 30% and 100% even while fresh content is still being surfaced — the algorithm interleaves pockets of old and new. A "3 consecutive scrolls > N% stale" rule fires on the stale pockets and misses the fresh ones right after.
+On a verified hidden page, the helper requests a browser screenshot after each
+scroll before extraction. A locked Chrome can update scroll position without
+rendering X's virtualized timeline; the screenshot requests a real frame so new
+tiles appear. It overwrites `/tmp/twitter-digest-run/background-frame.png`,
+records `backgroundFrames`, and never sends the image to a model. This does not
+change page visibility, lifecycle, or desktop state.
 
 #### Filters
 
@@ -181,39 +187,26 @@ The only mutating actions allowed in step 3. Apply in whatever order the observe
 - `[role="tablist"] [role="tab"]` — tablist tabs (For You / Following)
 - `[data-testid="article-cover-image"]` — long-form X Article indicator (inside the tile). Articles do NOT have `/article/` URLs in tiles — they're reached via the same `/status/` URL as a regular tweet, which X redirects to the article view.
 
-### 3a. Stall handling (screenshot-then-judge)
+### 3a. Stall handling (implemented by the production collector)
 
-When the current source has stalled — `window.scrollBy` followed by the `scrollIntoView` kick both produced 3 consecutive zero-new-tweet iterations — capture a screenshot and inspect it visually to choose the next move from the toolkit. Predetermined DOM checks ("is there a `[role=dialog]`?") fail every time X re-skins a modal; visual judgment generalizes.
+When the source stalls, `collect-digest.py` applies the sanctioned recoveries,
+re-probes visibility/auth/DOM state, captures a forensic screenshot when it
+ships on a clean plateau, and writes the decision to `collection.json`.
 
-Screenshots persist into the skill's state dir (`state/stalls/`) **regardless of whether the run ultimately succeeds, ships under-target, or hard-fails** — they are the only forensic artifact a human can inspect post-hoc to disambiguate the stall's cause (subtle modal vs. scroll-container regression vs. algorithmic plateau). `/tmp` reaping otherwise destroys them between fire and inspection. Keep the last 10 screenshots across all runs:
+The helper fingerprints visible dialogs and spends at most one native Escape
+attempt per distinct dialog signature; a persistent selector match cannot burn
+the cap repeatedly. It checks rendered descendants of zero-height dialog roots
+and verifies that Escape removed the obstruction. A persistent or recurring
+blocking dialog is `kind: stall`, never a clean plateau. At every mature stall it re-probes page visibility,
+authentication, and the primary column before deciding that a plateau is
+clean. Under-target feeds spend the bounded `scrollTo(0, 0)` and Home-refresh
+recoveries before shipping under target.
 
-```bash
-STALLS_DIR=~/.claude/skills/twitter-digest/state/stalls
-mkdir -p "$STALLS_DIR"
-SCREENSHOT="$STALLS_DIR/$(date -u +%Y%m%dT%H%M%SZ).png"
-browser-use --cdp-url http://127.0.0.1:9222 screenshot "$SCREENSHOT"
-
-# Prune to last 10 by mtime
-ls -t "$STALLS_DIR"/*.png 2>/dev/null | tail -n +11 | xargs -I {} rm -f {}
-```
-
-If the screenshot tool times out repeatedly (a known transient issue with the daemon Chrome under load), fall back to a DOM-text snapshot — `eval "document.body.innerText.slice(0, 4000)"` — and judge from text. Less reliable for visual-only states (e.g., a black-render visibility failure) but unblocks the run. Note the degraded-classification source in the run log so the operator knows.
-
-Then *read the image (or text) yourself* and pick the next tactic:
-
-| What you see | Action |
-|---|---|
-| Empty timeline / repeated tweets / "you're all caught up" / "see new posts" pill / no obvious obstruction | Feed is genuinely exhausted. **Ship** with what's accumulated. |
-| Modal / dialog / banner / snooze prompt / "verified is here" / birthday card / year-in-review / any interstitial obstructing the timeline | **Press Escape** (if Esc cap remaining), wait 3s, `scrollTo(0, 0)`, wait 1s, resume scroll loop with fresh stall counter. If Esc cap exhausted and the same modal-class state recurs, ship — don't escalate to clicks. |
-| Frozen-but-clean timeline (no obstruction, but `scrollBy` produces no movement and no new tweets after multiple attempts) | `scrollTo(0, 0)` (if cap remaining), wait 5s for prefetch, retry. If still frozen after exhausting `scrollTo` cap, ship. |
-| Login wall / "Sign up to continue" / OAuth flow / "Log in to X" copy | **Hard-fail `kind: "auth"`** with the screenshot path. Cookies expired mid-run; operator re-signs-in via the bot Chrome window. |
-| Page chrome looks fundamentally different from a normal X home (no `primaryColumn`, completely different layout, error page, "this site can't be reached") | **Hard-fail `kind: "dom"`** with the screenshot path. Operator updates selectors. |
-| Black render, blank page, or screenshot is mostly empty pixels | **Hard-fail `kind: "visibility"`** with the screenshot path. Window dropped foreground or display surface mid-scrape (rare with the dummy plug). |
-| Genuinely uncertain — the screen shows something but you can't classify it confidently | Try one cheap recovery (Esc if cap remaining; else `scrollTo(0, 0)` if cap remaining). If still unclassified after that, **hard-fail `kind: "stall"`** with the screenshot path. |
-
-#### Tactic dispatch notes
-
-Use native `browser-use keys "Escape"` for modal recovery; never synthesize DOM keyboard events. For the reasoning behind native Escape, tactic caps, and the restricted toolkit, see `/Users/pattybot/.claude/skills/twitter-digest/references/recovery-tactics.md`.
+Screenshots persist under `state/stalls/` for operator forensics and the helper
+keeps the last 10. Scheduled execution never opens, analyzes, or attaches them.
+The categorized failure record—not model interpretation of pixels—is the
+automation contract. For the operator-side screenshot taxonomy, see
+`references/runbook.md` and `references/recovery-tactics.md`.
 
 ### 4. Pull long-form articles (after scroll loop ends)
 
@@ -228,7 +221,7 @@ ARTICLE_JSON=$(/Users/pattybot/dotfiles/twitter/bin/lib/extract-article.sh "$ART
 
 The helper navigates the bot Chrome to `$ARTICLE_URL`, sleeps 3s for hydration, then extracts via the dedicated `[data-testid="twitterArticleRichTextView"]` (body) and `[data-testid="twitter-article-title"]` (title) selectors with legacy fallbacks. Returns clean JSON. Inspect `/Users/pattybot/dotfiles/twitter/bin/lib/extract-article.sh` for the full selector fallback chain.
 
-Sanity check: if `bodyLen < 500` and the URL still resolves to the article, the selectors missed the body container. Don't summarize from a tiny body — instead screenshot for the operator (`browser-use --cdp-url http://127.0.0.1:9222 screenshot /tmp/twitter-digest-article-debug.png`) and emit a one-line "📰 extraction failed" entry, then continue. Operator updates selectors next iteration.
+Sanity check: if `bodyLen < 500` and the URL still resolves to the article, the selectors missed the body container. Don't summarize from a tiny body — instead screenshot for the operator (`/Users/pattybot/dotfiles/twitter/bin/twitter-browser.sh screenshot /tmp/twitter-digest-article-debug.png`) and emit a one-line "📰 extraction failed" entry, then continue. Operator updates selectors next iteration.
 
 Otherwise summarize each article in 2-3 sentences. Capture `{ title, author, url, summary }`.
 
@@ -267,6 +260,8 @@ Everything below the header is the same regardless of which fire ran.
 
 <i>Summaries of tweets surfaced overnight; positions are the posters', not verified.</i>
 ```
+
+**Scan reporting:** use the actual `scanned` count from `collection.json` in the footer, never the target or bullet count. Include `target <scanTarget>`; when `scanShortfall > 0`, also include `<scanShortfall> below target (<reason>)`. Retain these facts in the run report even when no content merits a digest. Do not imply that a bounded successful run necessarily reached 150.
 
 **Per-bullet link rule**: wrap `@author tweeted/posted` attribution in `<a href="<statusUrl>">` so a tap on the attribution deep-links into the tweet. Don't add a separate link/arrow at the end. For long-form articles, wrap `@author` in the article link rather than adding a raw URL line. Telegram still renders these as clickable with `disable_web_page_preview=true`.
 

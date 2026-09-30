@@ -1,4 +1,8 @@
 #!/bin/bash
+# Retired after migration to Hermes on 2026-09-20.
+printf '%s\n' "Retired: cards now run through Hermes. Use hermes cron list and the credit-card-offers skill; do not provision a separate Keychain token." >&2
+exit 64
+
 # One-time, interactive setup. Secret values are never accepted as arguments.
 set -euo pipefail
 
@@ -11,15 +15,15 @@ KEYCHAIN="$HOME/.local/bin/cards-keychain"
 [ -x "$OP" ] || { echo "missing $OP" >&2; exit 1; }
 [ -x "$KEYCHAIN" ] || { echo "missing $KEYCHAIN" >&2; exit 1; }
 
-echo "Create a dedicated non-built-in 1Password vault containing only the Chase and Amex Login items."
-echo "Grant a service account read_items only on that vault (no write/share/create-vault access)."
+echo "Use the existing AI agents 1Password vault containing the Chase and Amex Login items."
+echo "Grant a service account read_items only on AI agents (no write/share/create-vault access)."
 read -r -s -p "Paste the one-time service-account token (input hidden): " TOKEN
 echo
 printf '%s' "$TOKEN" | "$KEYCHAIN" set
 TOKEN=""
 
-read -r -p "Chase Login item base ref (op://Vault/Item): " CHASE_ITEM
-read -r -p "Amex Login item base ref (op://Vault/Item): " AMEX_ITEM
+read -r -p "Chase Login item base ref (op://AI agents/Item): " CHASE_ITEM
+read -r -p "Amex Login item base ref (op://AI agents/Item): " AMEX_ITEM
 for ref in "$CHASE_ITEM" "$AMEX_ITEM"; do
   [[ "$ref" == op://*/* ]] || { echo "invalid 1Password item reference" >&2; exit 2; }
 done

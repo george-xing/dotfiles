@@ -1,0 +1,4 @@
+interface:
+  display_name: "Twitter Search"
+  short_description: "Summarize an X keyword search feed"
+  default_prompt: "Use $twitter-search to summarize what people on X are saying about a query."

@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 import importlib.util
+import json
 import os
 import stat
 import sys
@@ -75,6 +76,108 @@ class StateTests(unittest.TestCase):
         probe = {"hasPassword": False, "url": "https://www.chase.com/logout"}
         self.assertTrue(cards_auth.looks_logged_out(self.issuer("Chase"), probe))
 
+    def test_amex_login_page_is_not_a_ready_offers_page(self):
+        issuer = self.issuer("Amex")
+        issuer.needle = "americanexpress.com"
+        probe = {"hasPassword": True, "hasUsername": True, "hasSignOut": True,
+                 "textLen": 500, "text": "Log In to My Account",
+                 "url": "https://www.americanexpress.com/en-US/account/login"}
+        self.assertFalse(cards_auth.offers_page_ready(issuer, probe))
+
+    def test_amex_login_header_is_not_auth_evidence_when_inputs_are_transiently_missing(self):
+        issuer = self.issuer("Amex")
+        issuer.needle = "americanexpress.com"
+        probe = {"hasPassword": False, "hasUsername": False, "hasSignOut": True,
+                 "textLen": 500, "text": "Log Out Log In to My Account",
+                 "url": "https://www.americanexpress.com/en-US/account/login"}
+        self.assertFalse(cards_auth.looks_logged_in(issuer, probe))
+
+    def test_amex_protected_offers_page_is_ready(self):
+        issuer = self.issuer("Amex")
+        issuer.needle = "americanexpress.com"
+        probe = {"hasPassword": False, "hasUsername": False, "hasSignOut": True,
+                 "textLen": 500, "text": "Amex Offers Added to Card",
+                 "url": "https://global.americanexpress.com/offers/eligible"}
+        self.assertTrue(cards_auth.offers_page_ready(issuer, probe))
+
+    def test_amex_intermediate_authenticated_page_waits_for_destination(self):
+        issuer = self.issuer("Amex")
+        issuer.needle = "americanexpress.com"
+        probe = {"hasPassword": False, "hasUsername": False, "hasSignOut": True,
+                 "textLen": 500, "text": "Account Summary Membership Rewards",
+                 "url": "https://global.americanexpress.com/dashboard"}
+        self.assertFalse(cards_auth.login_transition_settled(issuer, probe, 5))
+        self.assertTrue(cards_auth.login_transition_settled(
+            issuer, probe, cards_auth.AMEX_DESTINATION_GRACE_SECONDS
+        ))
+
+    def test_amex_natural_offers_destination_settles_immediately(self):
+        issuer = self.issuer("Amex")
+        issuer.needle = "americanexpress.com"
+        probe = {"hasPassword": False, "hasUsername": False, "hasSignOut": True,
+                 "textLen": 500, "text": "Amex Offers Added to Card",
+                 "url": "https://global.americanexpress.com/offers/eligible"}
+        self.assertTrue(cards_auth.login_transition_settled(issuer, probe, 2))
+
+    def test_amex_returned_login_form_honors_rejection_grace(self):
+        issuer = self.issuer("Amex")
+        probe = {"hasPassword": True, "hasUsername": True, "textLen": 500,
+                 "text": "Log In to My Account", "url": "https://www.americanexpress.com/account/login"}
+        self.assertFalse(cards_auth.login_transition_settled(issuer, probe, 5))
+        self.assertTrue(cards_auth.login_transition_settled(
+            issuer, probe, cards_auth.LOGIN_REJECTION_GRACE_SECONDS
+        ))
+
+    def test_partial_authentication_is_not_success(self):
+        results = [
+            {"issuer": "Chase", "status": "authenticated"},
+            {"issuer": "Amex", "status": "error", "kind": "auth"},
+        ]
+        self.assertFalse(cards_auth.authentication_succeeded(results))
+
+    def test_both_issuers_must_authenticate(self):
+        results = [
+            {"issuer": "Chase", "status": "authenticated"},
+            {"issuer": "Amex", "status": "already_authenticated"},
+        ]
+        self.assertTrue(cards_auth.authentication_succeeded(results))
+
+    def test_auth_event_url_redacts_query_and_fragment(self):
+        value = cards_auth.redacted_url(
+            "https://example.com/login?token=secret#session"
+        )
+        self.assertEqual(value, "https://example.com/login")
+
+    def test_final_amex_redirect_to_login_is_rejected(self):
+        issuer = self.issuer("Amex")
+        issuer.needle = "americanexpress.com"
+        issuer.login_url = "https://www.americanexpress.com/en-us/account/login"
+        issuer.offers_url = "https://global.americanexpress.com/offers/eligible"
+
+        class FakeCDP:
+            def eval(self, expression):
+                return issuer.login_url
+
+            def navigate(self, url):
+                self.navigated = url
+
+        authenticated_probe = json.dumps({
+            "hasPassword": False, "hasUsername": False, "hasSignOut": True,
+            "textLen": 500, "text": "Account Summary Membership Rewards",
+            "url": "https://global.americanexpress.com/dashboard",
+        })
+        login_probe = json.dumps({
+            "hasPassword": True, "hasUsername": True, "hasSignOut": True,
+            "textLen": 500, "text": "Log In to My Account", "url": issuer.login_url,
+        })
+        with mock.patch.object(cards_auth.time, "sleep"), \
+                mock.patch.object(cards_auth, "page_probe", side_effect=[
+                    authenticated_probe, authenticated_probe, login_probe,
+                ]), \
+                mock.patch.object(cards_auth, "wait_until", side_effect=lambda fn, **kwargs: fn()):
+            with self.assertRaisesRegex(cards_auth.AuthError, "redirected back"):
+                cards_auth.finish_authenticated_navigation(FakeCDP(), issuer)
+
 
 class SecretHandlingTests(unittest.TestCase):
     def test_op_error_does_not_echo_reference_or_stderr(self):
@@ -108,6 +211,42 @@ class SecretHandlingTests(unittest.TestCase):
         self.assertTrue(cards_auth.submit_totp(cdp, issuer, "654321"))
         self.assertNotIn("654321", cdp.fn)
         self.assertEqual(cdp.args, ["654321"])
+
+    def test_auth_failure_screenshot_clears_all_inputs_first(self):
+        calls = []
+
+        class FakeCDP:
+            def eval(self, expression):
+                calls.append(("eval", expression))
+                return True
+
+            def screenshot(self, label):
+                calls.append(("screenshot", label))
+                return "/tmp/scrubbed.png"
+
+        issuer = cards_auth.Issuer("Amex", "", "", "", "u", "p", None,
+                                   "document", "#u", "#p", "#go")
+        error = cards_auth.auth_failure_with_screenshot(FakeCDP(), issuer, "rejected")
+        self.assertEqual(calls[0][0], "eval")
+        self.assertIn("querySelectorAll('input')", calls[0][1])
+        self.assertEqual(calls[1], ("screenshot", "amex-auth"))
+        self.assertIn("scrubbed.png", str(error))
+
+    def test_auth_event_contains_no_query_or_page_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "auth-events.jsonl"
+            with mock.patch.object(cards_auth, "AUTH_EVENTS", path):
+                cards_auth.record_auth_event(
+                    "Amex",
+                    "probe",
+                    url="https://example.com/login?token=secret",
+                    status="authenticated",
+                    text="sensitive page text",
+                )
+            event = json.loads(path.read_text())
+            self.assertEqual(event["url"], "https://example.com/login")
+            self.assertNotIn("text", event)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,30 @@ On-demand job: attach to the persistent bot Chrome on `127.0.0.1:9222`, navigate
 - **Telegram bot token**: parse from `~/.claude/channels/telegram/.env` (key `TELEGRAM_BOT_TOKEN`). Delivery uses `~/dotfiles/twitter/bin/lib/telegram-send.sh`.
 - **Telegram chat_id**: `7953915703`.
 
+## Browser isolation and locked-desktop operation
+
+Use `/Users/pattybot/dotfiles/twitter/bin/twitter-browser.sh` for every browser
+command (for example `open`, `eval`, `keys`, `screenshot`). This helper pins the
+compatible CLI and explicitly selects the dedicated `twitter-production` CDP
+session. Never substitute a bare `browser-use`, `browser_exec`, or a new Chrome.
+Digest, bookmarks, and search share the wrapper's existing lock; other Hermes
+requests can continue in their own browsers.
+
+A locked Mac can leave a fully usable X page `hidden`. After one native
+`Page.bringToFront` attempt, permit background reading only when the exact
+`https://x.com` origin and intended route are verified (`/home`, `/i/bookmarks`,
+or `/search` with the requested search input). X also redirects bookmarks to
+`/i/history`; accept that route only when the selected `[role="tab"]` is
+`Bookmarks` (never Likes). Require a non-zero viewport,
+`[data-testid="primaryColumn"]` and authenticated
+`[data-testid="AppTabBar_Profile_Link"]` navigation exist, no login wall exists,
+and the shared `extract-tweets.sh` returns at least one substantive post with
+text or article link, timestamp and status URL. Record `visibilityDegraded: true`.
+A blank document title alone does not indicate logout on a hidden page.
+Apply this content proof whenever desktop visibility is unavailable.
+If the proof fails, stop with the appropriate auth/dom/visibility failure;
+never fake visibility, unlock the Mac, or click its desktop/lock screen.
+
 ## Workflow
 
 ### 1. Load digested-URL dedup set
@@ -37,21 +61,25 @@ If `DIGESTED_COUNT == 0` this is the first (seed) fire — apply the 2-month twe
 ### 2. Attach to daemon Chrome, navigate to bookmarks, verify
 
 ```bash
-browser-use --cdp-url http://127.0.0.1:9222 open https://x.com/i/bookmarks
+/Users/pattybot/dotfiles/twitter/bin/twitter-browser.sh open https://x.com/i/bookmarks
 sleep 4
-browser-use --cdp-url http://127.0.0.1:9222 eval "
+/Users/pattybot/dotfiles/twitter/bin/twitter-browser.sh eval "
   JSON.stringify({
     title: document.title,
     vis: document.visibilityState,
     iw: innerWidth,
     ih: innerHeight,
+    isBookmarkRoute: location.origin === 'https://x.com' &&
+      (location.pathname === '/i/bookmarks' ||
+       (location.pathname === '/i/history' && Array.from(document.querySelectorAll('[role=tab]'))
+         .some(t => t.getAttribute('aria-selected') === 'true' && t.innerText.trim() === 'Bookmarks'))),
     hasBookmarkList: !!document.querySelector('[aria-label*=\"Bookmark\"], [data-testid=\"primaryColumn\"]'),
     hasLoginWall: !!document.querySelector('a[href=\"/login\"]') || !!document.querySelector('a[href=\"/i/flow/login\"]')
   })
 "
 ```
 
-Expected: `vis === "visible"`, `iw > 0`, `ih > 0`, `title` includes "Bookmark", `hasBookmarkList === true`, `hasLoginWall === false`.
+Expected: `/i/bookmarks`, or the observed canonical `/i/history` with the Bookmarks tab selected, plus non-zero viewport, authenticated profile navigation, bookmark list present and no login wall. Reject `/i/history/likes` and any other selected tab. If `vis !== "visible"`, require the authenticated background-content proof above instead of a title/foreground check.
 
 **Failure semantics**: same `visibility` / `auth` / `dom` kinds and same `Page.bringToFront` self-recovery pattern as twitter-digest. See `/Users/pattybot/.claude/skills/twitter-digest/references/shared-operational-patterns.md` section "CDP Attach And Verify" for the stable shared reference.
 
@@ -65,6 +93,11 @@ Expected: `vis === "visible"`, `iw > 0`, `ih > 0`, `title` includes "Bookmark", 
 4. **Wall budget**: 5 minutes elapsed.
 5. **Plateau**: 3 consecutive zero-new scroll iterations.
 6. **Hard-fail kind**: `auth`, `dom`, `visibility`, `stall`.
+
+Keep the repetitive scroll, sleep, extraction, JSON accumulation/dedupe,
+counter, age, and elapsed-time checks inside **one terminal loop**. Do not
+spend one model/API turn per scroll. Return to model reasoning after collection
+ends, when articles need synthesis, or on a categorized hard failure.
 
 #### Sanctioned tactic toolkit
 
@@ -86,7 +119,7 @@ Alternate a scroll and a call to the shared extraction helper. Pause 1-2s after 
 
 ```bash
 # Scroll the bookmarks list.
-browser-use --cdp-url http://127.0.0.1:9222 eval "window.scrollBy(0, 1500); 'ok'"
+/Users/pattybot/dotfiles/twitter/bin/twitter-browser.sh eval "window.scrollBy(0, 1500); 'ok'"
 sleep 1.5
 
 # Extract currently-rendered tiles via the shared helper. Returns clean JSON.
@@ -107,11 +140,15 @@ This is intentionally approximate. The DOM doesn't expose bookmark save date dir
 
 Use the shared screenshot-then-judge pattern: capture visual state, classify it, then recover or hard-fail. See `/Users/pattybot/.claude/skills/twitter-digest/references/shared-operational-patterns.md` section "Stall Handling" for the full classification table. Screenshots persist to `state/stalls/` (last 10 kept):
 
+Before taking or attaching a screenshot, use the shared visible-dialog fast
+path: press native Escape when a visible `[role="dialog"]` exists and the cap
+remains, then scroll to the top and resume with a fresh stall counter.
+
 ```bash
 STALLS_DIR=~/.claude/skills/twitter-bookmarks/state/stalls
 mkdir -p "$STALLS_DIR"
 SCREENSHOT="$STALLS_DIR/$(date -u +%Y%m%dT%H%M%SZ).png"
-browser-use --cdp-url http://127.0.0.1:9222 screenshot "$SCREENSHOT"
+/Users/pattybot/dotfiles/twitter/bin/twitter-browser.sh screenshot "$SCREENSHOT"
 ls -t "$STALLS_DIR"/*.png 2>/dev/null | tail -n +11 | xargs -I {} rm -f {}
 ```
 
@@ -130,7 +167,7 @@ The helper navigates the bot Chrome to `$ARTICLE_URL`, sleeps 3s for hydration, 
 
 Sanity check: if `bodyLen < 500` and the URL resolves to the article, the selectors missed the body. Don't summarize from a tiny body — screenshot to `state/stalls/` and emit a one-line "📰 extraction failed" entry, then continue.
 
-After each article, navigate back: `browser-use --cdp-url http://127.0.0.1:9222 open https://x.com/i/bookmarks` (don't try browser history — CDP-detached browsing can get desynced).
+After each article, navigate back: `/Users/pattybot/dotfiles/twitter/bin/twitter-browser.sh open https://x.com/i/bookmarks` (don't try browser history — CDP-detached browsing can get desynced).
 
 Summarize each article in 2-3 sentences. Capture `{ title, author, url, summary }`.
 

@@ -289,7 +289,29 @@ def main():
     parser=argparse.ArgumentParser(); parser.add_argument("--dry-run", action="store_true"); args=parser.parse_args()
     STATE.mkdir(parents=True, exist_ok=True)
     results=[]; errors=[]
+    available_raw = os.environ.get("CARDS_AVAILABLE_ISSUERS")
+    available = (
+        {x.strip() for x in available_raw.split(",") if x.strip()}
+        if available_raw is not None else {"Chase", "Amex"}
+    )
+    try:
+        auth_failures = {
+            x.get("issuer"): x
+            for x in json.loads(os.environ.get("CARDS_AUTH_FAILURES_JSON", "[]"))
+        }
+    except Exception:
+        auth_failures = {}
     for fn, name in ((chase,"Chase"),(amex,"Amex")):
+        if name not in available:
+            failure = auth_failures.get(name, {})
+            exc = OfferError(
+                name,
+                failure.get("kind", "auth"),
+                failure.get("message", f"{name} was unavailable after authentication"),
+            )
+            errors.append(exc)
+            results.append({"issuer":name,"ok":False,"activated":[],"failures":[str(exc)]})
+            continue
         try: results.append(fn(args.dry_run))
         except OfferError as exc:
             errors.append(exc); results.append({"issuer":name,"ok":False,"activated":exc.partial or [],"failures":[str(exc)]})
@@ -297,7 +319,7 @@ def main():
              "results":[{"issuer":x["issuer"],"ok":x.get("ok"),"available":x.get("available"),"activated":len(x.get("activated",[]))} for x in results],
              "errors":[{"issuer":e.issuer,"kind":e.kind,"message":str(e),"screenshot":e.screenshot} for e in errors]}
     if args.dry_run:
-        print(json.dumps(summary)); return 0 if not errors else 2
+        print(json.dumps(summary)); return 0 if len(errors) < 2 else 2
     pending={"runAt":datetime.now(timezone.utc).isoformat(),"chaseActivated":len(next(x for x in results if x["issuer"]=="Chase").get("activated",[])),"amexActivated":len(next(x for x in results if x["issuer"]=="Amex").get("activated",[])),"telegramOk":None}
     atomic_json(STATE/"pending.json",pending)
     try:
@@ -314,7 +336,7 @@ def main():
         atomic_json(STATE/"last-failure.json",{"kind":"partial" if len(errors)<2 else "both_failed","at":datetime.now(timezone.utc).isoformat(),"failures":summary["errors"]})
     else:
         (STATE/"last-failure.json").unlink(missing_ok=True)
-    print(json.dumps(summary)); return 0 if not errors else 2
+    print(json.dumps(summary)); return 0 if len(errors) < 2 else 2
 
 
 if __name__ == "__main__":

@@ -7,9 +7,9 @@ This reference preserves the reasoning behind the hot-path recovery toolkit in `
 `Escape` must be a native key event via CDP `Input.dispatchKeyEvent`, not a synthetic `document.dispatchEvent(new KeyboardEvent(...))`. Use `browser-use keys`, which routes through Playwright's input pipeline and produces `event.isTrusted === true`:
 
 ```bash
-browser-use --cdp-url http://127.0.0.1:9222 keys "Escape"
+/Users/pattybot/dotfiles/twitter/bin/twitter-browser.sh keys "Escape"
 sleep 3
-browser-use --cdp-url http://127.0.0.1:9222 eval "window.scrollTo(0, 0); 'ok'"
+/Users/pattybot/dotfiles/twitter/bin/twitter-browser.sh eval "window.scrollTo(0, 0); 'ok'"
 sleep 1
 ```
 
@@ -32,5 +32,5 @@ Stepping outside these moves, such as clicking arbitrary buttons, typing, submit
 - `kind: "dom"`: visibility OK, no login wall, but `primaryColumn` missing. Likely an X UI change. Operator updates selectors.
 - `kind: "telegram"`: Telegram delivery failed even after the plain-text retry. Captures the response description.
 - `kind: "empty"`: feed truly returned zero tweets after URL dedup. Treated as success: write `last-success.json` with `tweetCount: 0` and send the `Nothing notable` message.
-- **Under-target shipping is not a failure.** A run that produces 1-49 tweets is successful. The 50-tweet target only shapes how patiently to recover from stalls.
+- **Under-target shipping is not a failure.** A run that produces 1-149 unique eligible tweets can still be successful. The 150-tweet scan target shapes how patiently to recover from stalls; report actual scanned count, target, shortfall and stop reason without exceeding recovery or wall-budget caps.
 - `kind: "stall"`: scroll loop stalled and the screenshot did not match any recoverable or pre-categorized state. Operator inspects the screenshot at `last-failure.json#screenshot` and may update the classification table before re-firing.

@@ -1,4 +1,8 @@
 #!/bin/bash
+# Retired after migration to Hermes on 2026-09-20.
+printf '%s\n' "Retired: cards now run through Hermes. Use hermes cron list and the credit-card-offers skill; do not provision a separate Keychain token." >&2
+exit 64
+
 # Interactive CLI-only provisioning for the cards automation.
 # Account password, Secret Key, session token, service token, and bank secrets
 # are never printed or passed in command arguments.
@@ -10,7 +14,7 @@ OP="$HOME/.local/bin/op"
 KEYCHAIN="$HOME/.local/bin/cards-keychain"
 KEYCHAIN_SOURCE="$(dirname "$(realpath "$0")")/cards-keychain.swift"
 CONFIG="$HOME/.config/cards/onepassword.conf"
-VAULT="Pattybot"
+VAULT="AI agents"
 SERVICE_ACCOUNT_NAME="pattybot-cards-mac-mini"
 
 [ -x "$OP" ] || { echo "missing signed 1Password CLI at $OP" >&2; exit 1; }
@@ -18,10 +22,14 @@ if [ ! -x "$KEYCHAIN" ] || [ "$KEYCHAIN_SOURCE" -nt "$KEYCHAIN" ]; then
   echo "===> Building the local Keychain helper"
   TMP_HELPER="$KEYCHAIN.tmp.$$"
   xcrun swiftc -O "$KEYCHAIN_SOURCE" -o "$TMP_HELPER"
-  /usr/bin/codesign --force --sign - "$TMP_HELPER" >/dev/null 2>&1
+  /usr/bin/codesign --force --sign - --identifier com.pattybot.cards-keychain "$TMP_HELPER" >/dev/null 2>&1
   chmod 700 "$TMP_HELPER"
   mv "$TMP_HELPER" "$KEYCHAIN"
 fi
+
+echo "===> Unlocking and checking Login Keychain before creating any account"
+/usr/bin/security unlock-keychain "$HOME/Library/Keychains/login.keychain-db"
+"$KEYCHAIN" preflight
 
 echo "===> 1Password CLI sign-in"
 if [ "$("$OP" account list --format json | /usr/bin/python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')" -eq 0 ]; then
@@ -69,9 +77,12 @@ TOKEN=$("$OP" service-account create "$SERVICE_ACCOUNT_NAME" --vault "$VAULT:rea
 trap 'TOKEN=""; unset TOKEN OP_SERVICE_ACCOUNT_TOKEN' EXIT
 [ -n "$TOKEN" ] || { echo "1Password returned an empty service-account token" >&2; exit 3; }
 
-echo "===> Unlocking Login Keychain for the one-time token transfer"
-/usr/bin/security unlock-keychain "$HOME/Library/Keychains/login.keychain-db"
-printf '%s' "$TOKEN" | "$KEYCHAIN" set
+echo "===> Storing and verifying the one-time token in Login Keychain"
+until printf '%s' "$TOKEN" | "$KEYCHAIN" set; do
+  echo "Token storage failed. The token is still held in this process; no new account will be created on retry." >&2
+  echo "Unlock Login Keychain or approve the helper's Keychain prompt, then press Enter to retry." >&2
+  read -r
+done
 export OP_SERVICE_ACCOUNT_TOKEN="$TOKEN"
 
 CHASE_BASE="op://$VAULT/$CHASE_ITEM_ID"

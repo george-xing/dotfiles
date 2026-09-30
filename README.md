@@ -6,16 +6,28 @@ Personal config for my Mac mini. Each top-level directory is a **package** — a
 
 ```bash
 cd ~/dotfiles
-stow -t ~ twitter-digest       # install
-stow -t ~ -D twitter-digest    # uninstall
-stow -t ~ -R twitter-digest    # reinstall (idempotent refresh after layout changes)
+stow -t ~ twitter       # install
+stow -t ~ -D twitter    # uninstall
+stow -t ~ -R twitter    # reinstall (idempotent refresh after layout changes)
 ```
 
 `stow` refuses to clobber pre-existing real files in `$HOME` — it'll list them as conflicts and abort. Move them aside first and rerun.
 
 ## Packages
 
-- **`twitter-digest/`** — Morning (08:00 ET) and evening (22:00 ET) X/Twitter digest delivered to Telegram via a Claude Code skill + `browser-use` CLI + launchd. Requires: `browser-use` CLI + the Claude Code `browser-use` skill at `~/.claude/skills/browser-use/`, logged-in X cookies at `~/.claude/skills/twitter-digest/state/x-cookies.json` (not committed — export via `browser-use cookies export` after a manual `--headed` login), and a Telegram bot token at `~/.claude/channels/telegram/.env`. Operational runbook lives inside the package at `.claude/skills/twitter-digest/references/runbook.md`.
+- **[`cards/`](cards/README.md)** — Chase/Amex offers through Hermes's native
+  browser and 1Password tools, using a dedicated AI agents vault. Includes the
+  current skill, atomic activation journal, tests, and migration notes.
+- **`twitter/`** — Morning (08:00 ET) and evening (22:00 ET) X digest, bookmarks,
+  and search through Hermes, a dedicated Chrome profile, and verified Telegram
+  delivery. See `twitter/CLAUDE.md` and its skill runbooks.
+- **[`automation/`](automation/README.md)** — Daily checks of Hermes jobs,
+  failure diagnosis, tested repairs and bounded reruns. Includes installation,
+  health/retry helpers, and the maintenance skill.
+
+These are examples from a personal Mac setup. Adapt machine paths, browser
+profiles, delivery targets, and private credential configuration before use.
+No live credentials or run history are needed to read the examples.
 
 ## Not in the repo
 

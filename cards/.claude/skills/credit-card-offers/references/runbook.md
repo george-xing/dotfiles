@@ -1,136 +1,72 @@
-# credit-card-offers — runbook
+# Cards workflow — Hermes runbook
 
-Operational reference. `SKILL.md` owns the post-login offer workflow;
-`bin/cards-auth.py` exclusively owns authentication and sign-out.
-The normal post-login path is browser-aware and agentic. If Codex is
-unavailable because of model capacity, authentication, or usage limits,
-`cards-fire.sh` invokes the validated deterministic CDP fallback so the daily
-bank job does not depend on model credits.
+## Active configuration
 
-## One-time bootstrap
+- Agent skill: `/Users/pattybot/.hermes/skills/credit-card-offers/SKILL.md`
+  (symlink to `~/dotfiles/cards/.hermes/skills/credit-card-offers`).
+- Schedule: Hermes cron job `ca128bfd6cbe`, daily at 03:00 America/New_York.
+- Delivery: Hermes scheduler sends the final roundup to Telegram chat 7953915703.
+- Browser: existing cards Chrome on CDP port 19223, owned by
+  `com.pattybot.cards-bot-chrome`. Keep this daemon enabled.
+- Credentials: current Chase/Amex Login items in **AI agents**, resolved through
+  Hermes's `OP_SERVICE_ACCOUNT_TOKEN`. No cards-specific Keychain token is used.
+- Native credentials: discover handles with `browser_vault_list`; inject only
+  through `browser_vault_fill` with the exact observed `target_id`. Chase's
+  same-origin login iframe also requires `frame_selector: "#logonbox"`.
+  The saved Chase item must allow `https://secure.chase.com`; Amex must allow
+  `https://www.americanexpress.com`. Preserve exact-origin checking.
+- Cron toolsets must include `browser` alongside `terminal`, `file`, and `skills`.
+  Never route passwords through the former `cards-secret-fill.py` helper.
+- History: existing `~/.claude/skills/credit-card-offers/state/*-activated.json`;
+  new secret-free per-run journals in `state/hermes-runs/`. Hermes cron history
+  is the authority for message delivery and job execution status.
 
-1. Stow the package and start the dedicated Chrome:
-
-   ```bash
-   cd ~/dotfiles && stow -t ~ -R cards
-   ~/dotfiles/cards/bin/cards-bot-chrome-setup.sh
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.cards-bot-chrome.plist
-   ```
-
-2. In 1Password, create a dedicated non-built-in vault containing only the
-   Chase and Amex Login items. Service accounts cannot access Personal,
-   Private, Employee, or the default Shared vault. Grant the service account
-   `read_items` only; do not grant write/share/create-vault permissions.
-
-3. Run the CLI-only interactive provisioner. It registers/signs in the CLI,
-   creates `pattybot-cards-mac-mini` with `read_items` only, and pipes the
-   one-time token into Login Keychain without printing it or using an argument:
-
-   ```bash
-   ~/dotfiles/cards/bin/cards-onepassword-provision.sh
-   ```
-
-   Supply each base reference as `op://Vault/Item`. The generated config at
-   `~/.config/cards/onepassword.conf` contains references only and is mode
-   `0600`. If a Login item has a `one-time password` field, TOTP is enabled
-   automatically. Otherwise, SMS/push/CAPTCHA remains a manual challenge.
-
-4. Smoke-test without reading secrets or submitting forms:
-
-   ```bash
-   ~/dotfiles/cards/bin/cards-auth.py self-test
-   ~/dotfiles/cards/bin/cards-auth.py login --dry-run
-   ~/dotfiles/cards/bin/cards-fire.sh credit-card-offers --dry-run
-   ```
-
-5. After one successful live run, load the daily job. Keepalive must remain
-   unloaded because every fire now signs in fresh and signs out afterward:
-
-   ```bash
-   launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.cards-keepalive.plist 2>/dev/null || true
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.credit-card-offers.plist
-   ```
-
-## Authentication invariants
-
-- Secrets are resolved just-in-time through `op read` using the vault-scoped
-  service account held in Login Keychain.
-- Username, password, TOTP, and service-account token are never logged,
-  persisted in state, passed as shell arguments, or embedded in evaluated JS.
-- Each bank login form is submitted at most once per fire. A rejection is not
-  retried.
-- Only one unambiguous TOTP input plus one unambiguous confirmation control may
-  be automated. SMS, push, CAPTCHA, device verification, and ambiguous flows
-  stop safely and trigger a Telegram notice.
-- Challenge screenshots are captured only after password/OTP-like inputs are
-  cleared.
-- Logout is successful only after the login wall is observed again.
-
-## Enforced agent boundary
-
-Only deterministic authentication runs with access to the 1Password service
-account. `cards-fire.sh` starts the post-login Codex process through macOS
-`sandbox-exec` with `config/cards-agent.sb`. The agent and every child process
-are denied:
-
-- the cards `op://` reference configuration and 1Password application state;
-- `op`, `cards-keychain`, `security`, `osascript`, and authentication code;
-- Keychain/securityd IPC, including from a copied or newly compiled helper;
-- writes to the sandbox, wrapper, fallback, skill, launchd plist, credential
-  tooling, shell startup files, SSH configuration, and LaunchAgents.
-
-CDP on port 19223, state/dedup files, screenshots, Telegram delivery, and
-Codex network access remain available. The deterministic fallback is reviewed
-code, not a model process, and runs outside this agent sandbox after login.
-
-The boundary smoke test should show the broker succeeding outside the sandbox,
-failing inside it, secret config unreadable, and CDP allowed. Never print or
-persist the broker output while testing.
-
-## Manual challenge recovery
-
-For `kind:mfa` or `kind:challenge`, open the cards Chrome on the Mac mini and
-complete the displayed challenge. Then re-run once:
+## Check without logging in
 
 ```bash
-~/dotfiles/cards/bin/cards-fire.sh credit-card-offers
+hermes cron list
+hermes cron status
 ```
 
-Do not repeatedly submit passwords or codes. The automation deliberately does
-not guess MFA methods, dismiss consent screens, or bypass challenges.
+Ask Hermes for a dry-run with the cards skill to inspect browser state and
+native vault metadata. Dry-run must not fill inputs or mutate bank state.
+Metadata access alone does not prove password resolution or authentication.
 
-## Rotation and revocation
+## Manual live run
 
-`cards-onepassword-setup.sh` remains available for token rotation when a new
-service account has already been created. Revoke the old service account after
-confirming the replacement works. If the Mac mini is lost or compromised,
-revoke the service account and terminate the bank sessions immediately.
+Find the job ID with `hermes cron list`, then run `hermes cron run JOB_ID`
+once. This performs the complete authorized bank-login/offer/sign-out workflow
+and sends the roundup. Do not launch another run while it is active.
+Pause/resume with `hermes cron pause JOB_ID` / `hermes cron resume JOB_ID`.
+MFA, device verification, CAPTCHA, and rejected logins require human attention;
+Hermes continues the other issuer and reports a partial result.
 
-## Schedule and inspection
+## Daily repair and verification
 
-The checked-in plist fires daily at 03:00 local time. Verify the loaded copy:
+The `hermes-maintenance` job runs at 09:00 America/New_York. It checks every
+enabled Hermes job plus the cards journal, tests supported source repairs,
+and reruns through the existing jobs with a three-attempt daily limit. Check
+`hermes cron list` for its current ID and status. See
+`~/dotfiles/automation/README.md` for installation and manual checks.
 
-```bash
-launchctl print gui/$(id -u)/com.pattybot.credit-card-offers | sed -n '/event triggers/,/event channels/p'
-```
+The active cards workflow imports `cards/bin/cards_journal.py` in native
+`browser_exec`. This tests persistence before bank mutations and checkpoints
+each verified activation without inline shell snippets. Use the Hermes skill's
+`references/runtime.md`; partial outcomes carry `[CRON_FAILURE]` on a separate
+first line so the scheduler and maintenance agree about completion.
 
-Manual launchd-equivalent fire:
+## Retired components
 
-```bash
-launchctl kickstart -p gui/$(id -u)/com.pattybot.credit-card-offers
-```
+`com.pattybot.credit-card-offers` and `com.pattybot.cards-keepalive` are disabled.
+The old launchd daily plist has no schedule. `cards-fire.sh` exits with migration
+guidance, so an old caller cannot start the former workflow. Do not re-enable
+these jobs or run the Keychain provisioners.
 
-## Logs and state
+`cards-secret-fill.py`, `cards-auth.py`, `cards-offers.py`, the Seatbelt profile, and the Keychain helper
+are retained as historical implementation files, not dependencies of this flow.
+The Keychain-scoped protection applied to the old Codex offers process; the new
+Hermes flow instead has the user's explicitly authorized 1Password vault access.
 
-- `~/Library/Logs/cards-fire.log` — authentication metadata and offer run log;
-  never secret values.
-- `~/Library/Logs/credit-card-offers.launchd.{out,err}.log` — launchd errors.
-- `~/.claude/skills/credit-card-offers/state/last-success.json` — last digest
-  success.
-- `~/.claude/skills/credit-card-offers/state/last-failure.json` — categorized
-  failure.
-- `~/.claude/skills/credit-card-offers/state/screenshots/` — mode-0600
-  challenge/DOM forensics.
-
-Common failure kinds: `config`, `onepassword`, `browser`, `auth`, `mfa`,
-`challenge`, `dom`, `logout`, `telegram`, `busy`, and `prefire`.
+The failed provisioning attempt created a service account whose token was lost.
+Revoke that failed `pattybot-cards-mac-mini` account in 1Password. Do not revoke
+the separate service account currently used by Hermes.

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Twitter Search Dispatcher"
+  short_description: "Run an X search summary from Telegram"
+  default_prompt: "Use $twitter-search to run an X search summary from Telegram."

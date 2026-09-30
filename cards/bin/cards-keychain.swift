@@ -34,39 +34,29 @@ func fail(_ message: String, _ status: OSStatus? = nil) -> Never {
     exit(1)
 }
 
+// A launchd/GUI-launched CLI can have a different default search list.
+// Pin both queries and writes to the Login Keychain the provisioner unlocks.
+var loginKeychain: SecKeychain?
+let keychainPath = NSHomeDirectory() + "/Library/Keychains/login.keychain-db"
+let openStatus = SecKeychainOpen(keychainPath, &loginKeychain)
+guard openStatus == errSecSuccess, let loginKeychain = loginKeychain else {
+    fail("could not open Login Keychain", openStatus)
+}
+
 let base: [String: Any] = [
     kSecClass as String: kSecClassGenericPassword,
     kSecAttrService as String: service,
     kSecAttrAccount as String: account,
 ]
 
-guard CommandLine.arguments.count == 2 else {
-    fail("usage: cards-keychain set|get|delete")
+func queryFor(_ item: [String: Any]) -> [String: Any] {
+    var query = item
+    query[kSecMatchSearchList as String] = [loginKeychain]
+    return query
 }
 
-switch CommandLine.arguments[1] {
-case "set":
-    let secret = FileHandle.standardInput.readDataToEndOfFile()
-    guard !secret.isEmpty else { fail("refusing to store an empty secret") }
-    let found = SecItemCopyMatching(base as CFDictionary, nil)
-    let status: OSStatus
-    if found == errSecSuccess {
-        status = SecItemUpdate(base as CFDictionary,
-                               [kSecValueData as String: secret] as CFDictionary)
-    } else if found == errSecItemNotFound {
-        var add = base
-        add[kSecValueData as String] = secret
-        add[kSecAttrLabel as String] = "Cards automation — 1Password service account"
-        add[kSecAttrDescription as String] = "Read-only access to the Pattybot vault"
-        add[kSecAttrAccess as String] = trustedAccess()
-        status = SecItemAdd(add as CFDictionary, nil)
-    } else {
-        fail("could not inspect Keychain", found)
-    }
-    guard status == errSecSuccess else { fail("could not store secret", status) }
-
-case "get":
-    var query = base
+func readSecret(_ item: [String: Any]) -> Data {
+    var query = queryFor(item)
     query[kSecReturnData as String] = true
     query[kSecMatchLimit as String] = kSecMatchLimitOne
     var result: CFTypeRef?
@@ -74,14 +64,68 @@ case "get":
     guard status == errSecSuccess, let data = result as? Data else {
         fail("secret not available", status)
     }
-    FileHandle.standardOutput.write(data)
+    return data
+}
+
+func storeSecret(_ secret: Data, _ item: [String: Any]) {
+    let query = queryFor(item)
+    let found = SecItemCopyMatching(query as CFDictionary, nil)
+    let attributes: [String: Any] = [
+        kSecValueData as String: secret,
+        kSecAttrLabel as String: "Cards automation — 1Password service account",
+        kSecAttrDescription as String: "Read-only access to the AI agents vault",
+        kSecAttrAccess as String: trustedAccess(),
+    ]
+    let status: OSStatus
+    if found == errSecSuccess {
+        status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+    } else if found == errSecItemNotFound {
+        var add = item.merging(attributes) { _, new in new }
+        add[kSecUseKeychain as String] = loginKeychain
+        status = SecItemAdd(add as CFDictionary, nil)
+    } else {
+        fail("could not inspect Login Keychain", found)
+    }
+    guard status == errSecSuccess else { fail("could not store secret", status) }
+    guard readSecret(item) == secret else { fail("Keychain read-back did not match") }
+}
+
+guard CommandLine.arguments.count == 2 else {
+    fail("usage: cards-keychain set|get|delete|preflight")
+}
+
+switch CommandLine.arguments[1] {
+case "set":
+    let secret = FileHandle.standardInput.readDataToEndOfFile()
+    guard !secret.isEmpty else { fail("refusing to store an empty secret") }
+    storeSecret(secret, base)
+
+case "get":
+    FileHandle.standardOutput.write(readSecret(base))
+
+case "preflight":
+    // Exercise add/update/read/delete with non-secret data before issuing a token.
+    var probe = base
+    probe[kSecAttrService as String] = service + ".probe." + UUID().uuidString
+    storeSecret(Data("cards-keychain-probe".utf8), probe)
+    storeSecret(Data("cards-keychain-probe-updated".utf8), probe)
+    let deleted = SecItemDelete(queryFor(probe) as CFDictionary)
+    guard deleted == errSecSuccess else { fail("could not remove probe item", deleted) }
+    let found = SecItemCopyMatching(queryFor(base) as CFDictionary, nil)
+    if found == errSecSuccess {
+        // Keep the old token intact while checking that it can be replaced.
+        storeSecret(readSecret(base), base)
+    } else if found != errSecItemNotFound {
+        fail("could not inspect existing token", found)
+    }
+    print("Login Keychain storage and read-back verified.")
 
 case "delete":
-    let status = SecItemDelete(base as CFDictionary)
+    let status = SecItemDelete(queryFor(base) as CFDictionary)
     guard status == errSecSuccess || status == errSecItemNotFound else {
         fail("could not delete secret", status)
     }
 
 default:
-    fail("usage: cards-keychain set|get|delete")
+    fail("usage: cards-keychain set|get|delete|preflight")
 }

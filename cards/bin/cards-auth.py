@@ -17,6 +17,7 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import websocket
@@ -28,12 +29,62 @@ OP = HOME / ".local/bin/op"
 KEYCHAIN = HOME / ".local/bin/cards-keychain"
 CDP_BASE = "http://127.0.0.1:19223"
 LOGIN_REJECTION_GRACE_SECONDS = 12
+AMEX_DESTINATION_GRACE_SECONDS = 20
+AUTH_EVENTS = HOME / ".claude/skills/credit-card-offers/state/auth-events.jsonl"
 
 
 class AuthError(RuntimeError):
     def __init__(self, kind: str, message: str):
         super().__init__(message)
         self.kind = kind
+
+
+def redacted_url(value: str) -> str:
+    """Keep only the origin and path; auth URLs can carry sensitive queries."""
+    try:
+        parsed = urllib.parse.urlsplit(str(value or ""))
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return "<unavailable>"
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    except Exception:
+        return "<unavailable>"
+
+
+def record_auth_event(issuer: str, stage: str, **details):
+    """Append secret-free auth transition metadata without affecting the run."""
+    try:
+        AUTH_EVENTS.parent.mkdir(parents=True, exist_ok=True)
+        event = {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "issuer": issuer,
+            "stage": stage,
+        }
+        for key, value in details.items():
+            if key == "url":
+                event[key] = redacted_url(str(value))
+            elif isinstance(value, (bool, int, float)) or value is None:
+                event[key] = value
+            elif key in {"kind", "status"}:
+                event[key] = str(value)[:80]
+        fd = os.open(AUTH_EVENTS, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, (json.dumps(event, sort_keys=True) + "\n").encode())
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+
+def record_probe(issuer: "Issuer", stage: str, probe: dict):
+    record_auth_event(
+        issuer.name,
+        stage,
+        url=probe.get("url"),
+        loginForm=login_form_ready(probe),
+        loggedIn=looks_logged_in(issuer, probe),
+        offersReady=offers_page_ready(issuer, probe),
+        otpCount=int(probe.get("otpCount") or 0),
+    )
 
 
 def load_config(path: Path = CONFIG) -> dict[str, str]:
@@ -251,12 +302,36 @@ def submit_totp(cdp: CDP, issuer: Issuer, otp: str) -> bool:
     return cdp.call_function(issuer.frame_expr, function, [otp]) == "submitted"
 
 
+def clear_auth_inputs(cdp: CDP, issuer: Issuer):
+    """Remove credential-like values before any authentication screenshot."""
+    cdp.eval(f'''(()=>{{
+      const d={issuer.frame_expr};
+      for(const x of d.querySelectorAll('input')) x.value='';
+      return true;
+    }})()''')
+
+
+def auth_failure_with_screenshot(cdp: CDP, issuer: Issuer, message: str) -> AuthError:
+    try:
+        clear_auth_inputs(cdp, issuer)
+        shot = cdp.screenshot(f"{issuer.name.lower()}-auth")
+    except Exception:
+        shot = None
+    suffix = f"; screenshot={shot}" if shot else ""
+    return AuthError("auth", f"{message}{suffix}")
+
+
 def looks_logged_in(issuer: Issuer, probe: dict) -> bool:
     if probe.get("hasPassword") or probe.get("hasUsername"):
         return False
     url = probe.get("url", "")
     text = probe.get("text", "")
-    if probe.get("hasSignOut") and issuer.needle in url:
+    # Amex's login page paradoxically renders a "Log Out" header. During form
+    # submission its inputs can briefly disappear, so that header alone caused
+    # a false authenticated transition on 2026-07-19. The protected/non-login
+    # URL is required before sign-out can be positive evidence for Amex.
+    if (probe.get("hasSignOut") and issuer.needle in url
+            and not (issuer.name == "Amex" and "/account/login" in url.lower())):
         return True
     if probe.get("textLen", 0) < 150:
         return False
@@ -273,17 +348,86 @@ def login_form_ready(probe: dict) -> bool:
     return bool(probe.get("hasUsername") and probe.get("hasPassword"))
 
 
-def finish_authenticated_navigation(cdp: CDP, issuer: Issuer):
+def offers_page_ready(issuer: Issuer, probe: dict) -> bool:
+    """Return true only when the issuer's protected offers page is usable."""
+    if login_form_ready(probe) or not looks_logged_in(issuer, probe):
+        return False
+    url = str(probe.get("url") or "").lower()
     if issuer.name == "Chase":
-        # Chase's hash router can cancel dashboard bootstrap if the offers
-        # route is applied immediately after login. Let overview settle first.
-        wait_until(lambda: (lambda p: p if looks_logged_in(issuer, p) and p.get("textLen", 0) >= 150 else None)(json.loads(page_probe(cdp, issuer.frame_expr))), timeout=20)
+        return "/merchantoffers/offer-hub" in url
+    return "global.americanexpress.com/offers/eligible" in url
+
+
+def login_transition_settled(issuer: Issuer, probe: dict, elapsed: float) -> bool:
+    """Decide when post-submit state is authoritative enough to act on."""
+    if offers_page_ready(issuer, probe):
+        return True
+    if looks_logged_in(issuer, probe):
+        # The Amex login URL carries DestPage=/offers/eligible. Let Amex finish
+        # that natural cross-subdomain redirect instead of navigating away as
+        # soon as an intermediate authenticated shell appears.
+        return issuer.name != "Amex" or elapsed >= AMEX_DESTINATION_GRACE_SECONDS
+    if probe.get("otpCount", 0):
+        return True
+    if login_form_ready(probe) and elapsed >= LOGIN_REJECTION_GRACE_SECONDS:
+        return True
+    return bool(re.search(
+        r"verification|security code|one-time|approve|text message|call us|captcha",
+        probe.get("text", ""), re.I,
+    ))
+
+
+def finish_authenticated_navigation(cdp: CDP, issuer: Issuer):
+    # Do not interrupt either issuer's post-login bootstrap. Amex in particular
+    # can briefly render authenticated chrome before its session cookie has
+    # settled; navigating to Offers during that window sends it back to login.
+    stable = wait_until(
+        lambda: (lambda p: p if looks_logged_in(issuer, p) and p.get("textLen", 0) >= 150 else None)(
+            json.loads(page_probe(cdp, issuer.frame_expr))
+        ),
+        timeout=20,
+    )
+    if not stable:
+        raise AuthError("auth", f"{issuer.name} authentication did not settle")
+    record_probe(issuer, "authenticated-shell", stable)
+    if issuer.name == "Amex":
+        time.sleep(5)
+        stable = json.loads(page_probe(cdp, issuer.frame_expr))
+        record_probe(issuer, "authenticated-shell-stability-check", stable)
+        if not looks_logged_in(issuer, stable):
+            raise AuthError("auth", f"{issuer.name} authentication did not remain stable")
     if issuer.offers_url not in str(cdp.eval("location.href")):
         cdp.navigate(issuer.offers_url)
         time.sleep(10 if issuer.name == "Chase" else 5)
+    # The protected destination is authoritative. Amex can accept a login,
+    # briefly show an authenticated page, and then redirect /offers/eligible
+    # back to its login wall. Never report authentication success until the
+    # final destination itself has settled and passed the authenticated probe.
+    probe = wait_until(
+        lambda: (lambda p: p if offers_page_ready(issuer, p) or login_form_ready(p) else None)(
+            json.loads(page_probe(cdp, issuer.frame_expr))
+        ),
+        timeout=25,
+    )
+    if not probe:
+        raise AuthError("dom", f"{issuer.name} offers page did not become ready")
+    record_probe(issuer, "protected-offers-probe", probe)
+    if not offers_page_ready(issuer, probe):
+        raise AuthError("auth", f"{issuer.name} redirected back to the login form after authentication")
+    return probe
+
+
+def authentication_succeeded(results: list[dict], dry_run: bool = False) -> bool:
+    if dry_run:
+        return True
+    return bool(results) and all(
+        result.get("status") not in ("error", "login_required")
+        for result in results
+    )
 
 
 def login_one(issuer: Issuer, token: str, dry_run=False):
+    record_auth_event(issuer.name, "login-start", url=issuer.offers_url)
     ensure_tab(issuer.needle, issuer.login_url)
     cdp = CDP(issuer.needle).connect()
     try:
@@ -294,8 +438,15 @@ def login_one(issuer: Issuer, token: str, dry_run=False):
         probe = wait_until(lambda: (lambda p: p if login_form_ready(p) or looks_logged_in(issuer, p) else None)(json.loads(page_probe(cdp, issuer.frame_expr))), timeout=25)
         if not probe:
             raise AuthError("dom", f"{issuer.name} login page did not become ready")
+        record_probe(issuer, "initial-probe", probe)
         if looks_logged_in(issuer, probe):
-            finish_authenticated_navigation(cdp, issuer)
+            try:
+                finish_authenticated_navigation(cdp, issuer)
+            except AuthError as exc:
+                if exc.kind == "auth":
+                    raise auth_failure_with_screenshot(cdp, issuer, str(exc))
+                raise
+            record_auth_event(issuer.name, "login-complete", status="already_authenticated", url=issuer.offers_url)
             return {"issuer": issuer.name, "status": "already_authenticated"}
         if dry_run:
             return {"issuer": issuer.name, "status": "login_required"}
@@ -307,14 +458,13 @@ def login_one(issuer: Issuer, token: str, dry_run=False):
             fill_and_submit(cdp, issuer, username, password)
         finally:
             username = password = None
+        record_auth_event(issuer.name, "credentials-submitted", url=probe.get("url"))
         submitted_at = time.monotonic()
 
         def settled():
             try:
                 p = json.loads(page_probe(cdp, issuer.frame_expr))
-                if (looks_logged_in(issuer, p) or p.get("otpCount", 0)
-                        or (login_form_ready(p) and time.monotonic() - submitted_at >= LOGIN_REJECTION_GRACE_SECONDS)
-                        or re.search(r"verification|security code|one-time|approve|text message|call us|captcha", p.get("text", ""), re.I)):
+                if login_transition_settled(issuer, p, time.monotonic() - submitted_at):
                     return p
             except Exception:
                 pass
@@ -322,11 +472,20 @@ def login_one(issuer: Issuer, token: str, dry_run=False):
         probe = wait_until(settled, timeout=40)
         if not probe:
             raise AuthError("auth", f"{issuer.name} login did not settle")
+        record_probe(issuer, "post-submit-settled", probe)
         if looks_logged_in(issuer, probe):
-            finish_authenticated_navigation(cdp, issuer)
+            try:
+                finish_authenticated_navigation(cdp, issuer)
+            except AuthError as exc:
+                if exc.kind == "auth":
+                    raise auth_failure_with_screenshot(cdp, issuer, str(exc))
+                raise
+            record_auth_event(issuer.name, "login-complete", status="authenticated", url=issuer.offers_url)
             return {"issuer": issuer.name, "status": "authenticated"}
         if login_form_ready(probe) and not re.search(r"verification|security code|one-time", probe.get("text", ""), re.I):
-            raise AuthError("auth", f"{issuer.name} rejected the login or returned to the sign-in form")
+            raise auth_failure_with_screenshot(
+                cdp, issuer, f"{issuer.name} rejected the login or returned to the sign-in form"
+            )
 
         # Only an unambiguous TOTP form may be automated. Push/SMS/CAPTCHA is manual.
         if probe.get("otpCount") == 1 and issuer.otp_ref:
@@ -339,9 +498,10 @@ def login_one(issuer: Issuer, token: str, dry_run=False):
                 success = wait_until(lambda: looks_logged_in(issuer, json.loads(page_probe(cdp, issuer.frame_expr))), timeout=35)
                 if success:
                     finish_authenticated_navigation(cdp, issuer)
+                    record_auth_event(issuer.name, "login-complete", status="authenticated_totp", url=issuer.offers_url)
                     return {"issuer": issuer.name, "status": "authenticated_totp"}
         # Remove anything secret-like before forensic capture.
-        cdp.eval(f'''(()=>{{const d={issuer.frame_expr}; for(const x of d.querySelectorAll('input[type=password],input')){{if(x.type==='password'||/otp|code|verification|security/i.test([x.id,x.name,x.autocomplete,x.placeholder,x.getAttribute('aria-label')].join(' '))) x.value='';}} return true;}})()''')
+        clear_auth_inputs(cdp, issuer)
         shot = cdp.screenshot(f"{issuer.name.lower()}-mfa")
         raise AuthError("mfa", f"{issuer.name} requires manual MFA; screenshot={shot}")
     finally:
@@ -411,9 +571,12 @@ def main():
         results = []
         for bank in banks:
             try:
-                results.append(logout_one(bank))
+                result = logout_one(bank)
+                results.append(result)
+                record_auth_event(bank.name, "logout-complete", status=result.get("status"))
             except AuthError as exc:
                 results.append({"issuer": bank.name, "status": "error", "kind": exc.kind, "message": str(exc)})
+                record_auth_event(bank.name, "logout-failed", kind=exc.kind, status="error")
         ok = all(x["status"] in ("logged_out", "already_logged_out") for x in results)
         print(json.dumps({"ok": ok, "results": results}))
         return 0 if ok else 3
@@ -426,7 +589,10 @@ def main():
             results.append(login_one(bank, token, args.dry_run))
         except AuthError as exc:
             results.append({"issuer": bank.name, "status": "error", "kind": exc.kind, "message": str(exc)})
-    ok = any(x["status"] not in ("error", "login_required") for x in results) if not args.dry_run else True
+            record_auth_event(bank.name, "login-failed", kind=exc.kind, status="error")
+    # Exit remains nonzero for partial authentication so callers must inspect
+    # issuer-level results explicitly instead of assuming both banks are ready.
+    ok = authentication_succeeded(results, args.dry_run)
     print(json.dumps({"ok": ok, "results": results}))
     return 0 if ok else 2
 

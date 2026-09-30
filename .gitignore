@@ -14,3 +14,11 @@
 # Claude Code per-machine overrides + remember plugin local state
 .claude/settings.local.json
 .remember/
+
+# Local checkouts, interpreter caches, and credentials
+.claude/worktrees/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example

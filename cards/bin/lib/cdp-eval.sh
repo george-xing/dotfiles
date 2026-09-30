@@ -127,7 +127,11 @@ if "error" in r:
 outer = r.get("result", {})
 if "exceptionDetails" in outer:
     ex = outer["exceptionDetails"]
-    emit(False, kind="dom-error", message=f"JS exception: {ex.get('text', 'unknown')}")
+    detail = (ex.get("exception") or {}).get("description") or ex.get("text", "unknown")
+    location = ""
+    if "lineNumber" in ex:
+        location = f" at {ex['lineNumber'] + 1}:{ex.get('columnNumber', 0) + 1}"
+    emit(False, kind="dom-error", message=f"JS exception{location}: {detail}"[:1200])
 res = outer.get("result", {})
 if res.get("subtype") == "error":
     emit(False, kind="dom-error", message=f"JS Error value: {res.get('description', 'unknown')}")

@@ -2,52 +2,67 @@
 
 ## Architecture (read this first)
 
-There are TWO launchctl jobs that work together:
+Hermes cron and one launchctl job work together:
 
 - `com.pattybot.twitter-bot-chrome` — long-running daemon Chrome with persistent profile at `~/Library/Application Support/twitter-bot-chrome/` and CDP debug port 9222. `KeepAlive: true`. **Always running.**
-- `com.pattybot.twitter-digest` — the twice-daily timer (08:00 and 22:00 ET) that fires the wrapper, which attaches to the daemon and runs the skill.
+- Hermes cron job `Twitter digest production schedule` — the twice-daily timer (08:00 and 22:00 ET) that runs `~/.hermes/scripts/twitter_digest_cron.sh`, which execs the wrapper. The legacy digest LaunchAgent is not active.
 
-The wrapper auto-foregrounds the bot Chrome window before each fire:
-- **Activate by PID** via System Events (PID-disambiguated so it can't accidentally target your daily Chrome).
-- **Bounded poll** (up to 5s) confirms the activation actually settled before claude -p starts.
-- **CDP `Browser.setWindowBounds windowState=normal`** as belt-and-braces for the dock-minimized case (best-effort — silently skipped if the system python3's websocket-client isn't installed; activation alone handles the more common "behind another window" case anyway).
-- **Restore prior frontmost after the fire** — but ONLY if bot Chrome is still frontmost at restore time. If you manually switched to another app during the 5-8 min scrape, your choice is preserved (no clobber).
+The shared production path supports both scheduled and Telegram-triggered runs:
 
-**TCC permission setup (one-time).** System Events scripting requires macOS Automation permission for the calling process. The launchd-fired bash invocation may not produce a visible TCC prompt the first time (launchd's security context doesn't always surface prompts in the active GUI session). To avoid silent activation skips on the first scheduled fire, **pre-grant the permission interactively before relying on launchd**:
+- `twitter-browser.sh` uses an isolated Browser Use 0.12.6 runtime and the explicit `twitter-production` session. Hermes's managed CLI3 and the global default session cannot displace it. All production helpers and skills use this client.
+- `twitter-prefire.sh` checks the dedicated Chrome and calls `twitter-window.py` for best-effort AppKit/CDP activation. It does not use System Events or desktop clicks. While the Mac is locked, it leaves the lock screen alone.
+- Hidden pages require exact route, authenticated profile navigation, non-zero viewport, no login wall, primary-column presence, and real post extraction. A failed proof remains a hard failure. No visibility spoofing is used.
+- Prior foreground restoration uses AppKit only when the bot browser is still frontmost; it never restores over the lock screen or another app chosen during the run.
+- **Hard process-group deadline** — 10 minutes for digest/search and 15 minutes for bookmarks. A timeout terminates Hermes and its descendants, writes `kind: timeout`, returns 124, and releases the shared lock.
+- **Delivery proof** — Hermes exit 0 is not sufficient because one-shot mode also exits 0 for apology/error text. Live runs only return 0 when `last-success.json#runAt` is fresh and `telegramOk` is true. A nominal Hermes success without that proof writes `kind: agent` and returns 70.
+
+Feed collection itself is deterministic: `bin/lib/collect-digest.py` owns the
+five-minute scroll/extract/recovery loop (target: 150 unique eligible tweets) and returns JSON candidates to Hermes
+for editorial triage. Stall screenshots are retained only for operator
+forensics and are never attached to the scheduled model context. This prevents
+a routine feed plateau from becoming a hanging multimodal provider call.
+
+**Locked desktop:** supported for authenticated read-only collection. No System Events Automation grant or manual unlock is required. If the content proof fails, inspect the categorized error; do not try to click or unlock the desktop.
+
+**Thin digests after a locked run:** compare `collection.json` and collector
+output in the Hermes session record. Repeated `new=0` from the first scroll can
+mean the initial DOM is readable but X's virtualized timeline is not rendering.
+The collector requests a screenshot frame after each hidden-page scroll and
+records `backgroundFrames`; it overwrites one `background-frame.png` in the run
+directory without model/vision calls or visibility spoofing. Also check for
+Snooze Topics: clicking an already-selected For You tab opens that dialog.
+The collector skips that click and verifies native Escape clears any blocking
+dialog. A persistent obstruction is a stall failure, not a clean plateau.
+
+**Pinned browser runtime:** maintained separately from Hermes and global tools. To reinstall the compatible client:
 
 ```bash
-~/dotfiles/twitter/bin/twitter-fire.sh twitter-digest --dry-run
+UV_TOOL_DIR=/Users/pattybot/.local/share/twitter-browser-tools UV_TOOL_BIN_DIR=/Users/pattybot/.local/lib/twitter-browser/bin UV_NO_CONFIG=1 /opt/homebrew/bin/uv tool install --python 3.11 'browser-use==0.12.6'
 ```
 
-Run this from your Terminal (or iTerm, etc.). The first time, macOS prompts with *"<Terminal>" wants to control "System Events"* — click **OK**. The permission persists in System Settings → Privacy & Security → Automation. After that, subsequent fires (manual or launchd-triggered) activate silently.
-
-If TCC is denied (or pre-grant was skipped), the wrapper logs a warning and continues without activation; the SKILL.md visibility check will hard-fail cleanly with `kind: visibility` — same outcome as before this feature, just no recovery.
+General Hermes browsing uses its own managed browser client; do not change that client to accommodate this legacy production workflow.
 
 ## Manual fire (any time)
 
-Fire via launchd (same code path as the scheduled triggers):
-```bash
-launchctl kickstart -p gui/$(id -u)/com.pattybot.twitter-digest
-```
-
-Or fire the wrapper directly (skips launchd, still uses the same code path):
+Fire the wrapper directly (the scheduled Hermes script uses the same code path):
 ```bash
 ~/dotfiles/twitter/bin/twitter-fire.sh twitter-digest            # live — sends to Telegram
 ~/dotfiles/twitter/bin/twitter-fire.sh twitter-digest --dry-run  # composes digest, prints to log only
 ```
 
-Or fire the skill straight from a `claude -p` prompt:
+Or fire it on demand from the owner Telegram chat:
 ```bash
-claude -p "run the twitter-digest skill"            # live
-claude -p "run the twitter-digest skill in dry-run" # dry
+/twitter_digest
+/bookmarks
+/twitter_search QUERY
 ```
 
-The wrapper does a 12s health check on `http://127.0.0.1:9222/json/version` before invoking `claude -p`. If the daemon Chrome isn't responding, the wrapper exits 2 immediately rather than burning a Claude turn.
+The wrapper does a 12s health check on `http://127.0.0.1:9222/json/version` before invoking Hermes one-shot. If the daemon Chrome isn't responding, the wrapper exits immediately rather than burning an agent turn.
 
 ## Logs
 
-- `~/Library/Logs/twitter-fire.log` — main per-fire log for both twitter skills. Each fire appends a `===== fire <iso> skill=<name> =====` / `----- exit <N> -----` block. Renamed from `twitter-digest.log` when the digest plist was switched to `twitter-fire.sh twitter-digest`.
-- `~/Library/Logs/twitter-digest.launchd.{out,err}.log` — launchd-level errors for the fire job (PATH / permissions / plist).
+- `~/Library/Logs/twitter-fire.log` — main per-fire log for all production Twitter skills. Each fire appends a `===== fire <iso> skill=<name> =====` / `----- exit <N> -----` block.
+- `~/.hermes/cron/output/fbfcdfbabe54/` — scheduled Hermes execution records.
 - `~/Library/Logs/twitter-bot-chrome.{out,err}.log` — the daemon Chrome's stdout/stderr. Useful when debugging why `127.0.0.1:9222` isn't responding.
 
 ## Daemon control (bot Chrome)
@@ -81,12 +96,7 @@ The cutoff for each run is read from `state/last-success.json#runAt`, so the win
 
 ## Change the fire times
 
-Edit `~/Library/LaunchAgents/com.pattybot.twitter-digest.plist` (`StartCalendarInterval` is an array of `{Hour, Minute}` dicts, one per daily trigger), then reload:
-```bash
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.twitter-digest.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pattybot.twitter-digest.plist
-launchctl print gui/$(id -u)/com.pattybot.twitter-digest | grep -E "Hour|Minute"
-```
+Use `hermes cron list` to inspect the live schedule and Hermes cron management commands to change it. Do not reload the legacy digest plist.
 
 ## Re-auth (when X eventually invalidates the bot's session)
 
@@ -111,12 +121,15 @@ All failure records may include a `screenshot` field — an absolute path under 
 
 | `kind` in last-failure.json | What happened | Fix |
 |---|---|---|
-| `visibility` | Bot Chrome window not foreground when scrape ran. `vis !== "visible"` after navigation. | The wrapper auto-foregrounds before each fire, so this should be rare. If it recurs, the cause is one of: (a) TCC Automation permission for bash was never granted (check System Settings → Privacy & Security → Automation; bash should appear with System Events checked); (b) the bot Chrome window is on a different macOS Space and activation didn't switch you over (rare — System Events activate usually pulls focus across Spaces); (c) launchd's bash invocation lost the TCC grant after a macOS update; (d) the HDMI dummy plug came loose and the mini reverted to true headless. Re-grant via interactive `~/dotfiles/twitter/bin/twitter-fire.sh twitter-digest --dry-run` and respond to the prompt; check `system_profiler SPDisplaysDataType` to confirm the dummy plug is still detected. |
+| `visibility` | The page had no usable viewport or failed authenticated background-content proof after native activation. | Inspect route, authentication, primary-column and extraction evidence. A locked desktop by itself is supported. Never spoof visibility or click the lock screen. |
 | `auth` | Login wall — X invalidated the bot's session, or detected mid-run via step 3a screenshot. | Sign in again interactively in the bot Chrome window (see "Re-auth" above). The screenshot in `last-failure.json#screenshot` will show the login wall variant if you want to confirm. |
 | `dom` | Visibility OK, no login wall, but `[data-testid="primaryColumn"]` not found, OR step 3a saw a fundamentally different page chrome. | X UI changed — update the selectors in SKILL.md step 2/3. The screenshot shows what X is rendering now. |
 | `telegram` | Telegram delivery failed even after the plain-text retry. | Check `state/last-failure.json#message` for Telegram's response. Often "message is too long" or "can't parse entities" — fix the compose step. |
 | `empty` | Feed served zero tweets in the cutoff window. | Treated as success (cutoff advances). If recurring, sanity-check feed in your daily Chrome. |
 | `stall` | Scroll stalled (3 consecutive zero-new-tweet iterations) and step 3a's screenshot didn't match any of the recoverable or pre-categorized states. | Open `last-failure.json#screenshot`. If it's a new modal variant: consider extending step 3a's classification table to recognize it as Esc-recoverable. If it's a new rate-limit / blocking pattern (e.g. "you've been temporarily limited"): add it as a ship-what-we-have row. If it looks like one of the existing categorized states but the agent missed it: tighten the classification language. After diagnosing, edit SKILL.md step 3a and re-fire — the failure-kind taxonomy is intentionally evolving rather than frozen. |
+| `timeout` | Hermes exceeded the wrapper's wall deadline. | Inspect the fire block for the last completed stage. The wrapper already terminated descendants and released the lock; retry after addressing a recurring slow stage. |
+| `agent` | Hermes exited non-zero, or returned 0 without fresh Telegram-confirmed success. | Read the one-shot final text in `twitter-fire.log`; state was intentionally not accepted as successful. |
+| `busy` | Another digest/search/bookmark fire held the shared lock. | Wait for that bounded run to finish, then retry. |
 
 ## Bootstrap (one-time, on a fresh mini)
 

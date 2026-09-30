@@ -34,9 +34,8 @@
 
 set -uo pipefail
 
-BROWSER_USE_BIN="/Users/pattybot/.local/bin/browser-use"
+BROWSER_USE_BIN="/Users/pattybot/dotfiles/twitter/bin/twitter-browser.sh"
 PYTHON_BIN="/usr/bin/python3"
-CDP_URL="http://127.0.0.1:9222"
 
 ARTICLE_URL="${1:-}"
 if [ -z "$ARTICLE_URL" ]; then
@@ -45,7 +44,7 @@ if [ -z "$ARTICLE_URL" ]; then
 fi
 
 # Step 1: navigate.
-"$BROWSER_USE_BIN" --cdp-url "$CDP_URL" open "$ARTICLE_URL" >/dev/null 2>&1
+"$BROWSER_USE_BIN" open "$ARTICLE_URL" >/dev/null 2>&1
 RC=$?
 if [ "$RC" -ne 0 ]; then
   echo "extract-article: navigation to $ARTICLE_URL failed (rc=$RC)" >&2
@@ -54,7 +53,7 @@ fi
 sleep 3
 
 # Step 2: extract via CDP eval. JS wraps result in JSON.stringify for clean stdout.
-RAW=$("$BROWSER_USE_BIN" --cdp-url "$CDP_URL" eval "
+RAW=$("$BROWSER_USE_BIN" eval "
   JSON.stringify((() => {
     const titleEl = document.querySelector('[data-testid=\"twitter-article-title\"]')
                 || document.querySelector('h1')
