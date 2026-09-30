@@ -1,0 +1,30 @@
+#!/bin/zsh
+
+set -euo pipefail
+
+readonly account_home="/Users/pattybot"
+readonly account_uid="$(id -u)"
+readonly gateway_label="ai.hermes.gateway"
+readonly gateway_plist="${account_home}/Library/LaunchAgents/${gateway_label}.plist"
+readonly plist_buddy="/usr/libexec/PlistBuddy"
+
+if [[ ! -f "${gateway_plist}" ]]; then
+  print -u2 "Missing Hermes LaunchAgent: ${gateway_plist}"
+  exit 1
+fi
+
+if ! "${plist_buddy}" -c "Set :EnvironmentVariables:HOME ${account_home}" "${gateway_plist}" 2>/dev/null; then
+  "${plist_buddy}" -c "Add :EnvironmentVariables:HOME string ${account_home}" "${gateway_plist}"
+fi
+
+"${plist_buddy}" -c "Delete :LimitLoadToSessionType" "${gateway_plist}" 2>/dev/null || true
+"${plist_buddy}" -c "Add :LimitLoadToSessionType array" "${gateway_plist}"
+"${plist_buddy}" -c "Add :LimitLoadToSessionType:0 string Aqua" "${gateway_plist}"
+
+plutil -lint "${gateway_plist}"
+
+/bin/launchctl bootout "user/${account_uid}/${gateway_label}" 2>/dev/null || true
+/bin/launchctl bootout "gui/${account_uid}/${gateway_label}" 2>/dev/null || true
+/bin/launchctl bootstrap "gui/${account_uid}" "${gateway_plist}"
+
+/bin/launchctl print "gui/${account_uid}/${gateway_label}" | grep -E 'state =|domain =|asid =|pid ='

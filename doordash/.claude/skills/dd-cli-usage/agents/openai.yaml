@@ -1,0 +1,4 @@
+interface:
+  display_name: "DoorDash CLI"
+  short_description: "Search, build carts, and order safely"
+  default_prompt: "Use $dd-cli-usage to find food and build a DoorDash cart safely."

@@ -24,6 +24,11 @@ stow -t ~ -R twitter    # reinstall (idempotent refresh after layout changes)
 - **[`automation/`](automation/README.md)** — Daily checks of Hermes jobs,
   failure diagnosis, tested repairs and bounded reruns. Includes installation,
   health/retry helpers, and the maintenance skill.
+- **[`doordash/`](doordash/hermes/README.md)** — DoorDash CLI skills, Hermes
+  persona and macOS gateway setup notes, with owner confirmation for checkout.
+- **[`whatsapp-digest/`](whatsapp-digest/CLAUDE.md)** — Read-only WhatsApp MCP
+  server, group digest tools, Telegram delivery, example configuration and tests.
+  Private group mappings and WhatsApp session credentials stay local.
 
 These are examples from a personal Mac setup. Adapt machine paths, browser
 profiles, delivery targets, and private credential configuration before use.

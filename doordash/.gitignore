@@ -1,0 +1,16 @@
+# Local credentials and environment
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Runtime state and logs
+*.log
+*.pid
+.heartbeat.json
+offset.json
+
+# Installed binaries and platform metadata
+dd-cli
+.DS_Store
